@@ -113,6 +113,12 @@ TODO: more info
   Check the comprehensive list of supported features in the [README](../README.md#features).
 
 - **Can I use this with other VNC servers?** \
-  Maybe. It has worked with x11vnc 0.9.17.
+  Maybe. It has worked with x11vnc 0.9.17. I don't know why you'd want to, though, when [w0vncserver](https://tigervnc.org/doc/w0vncserver.html) exists. The point of this project was to get the closed-source RealVNC and its proprietary extensions working on Wayland.
+
+- **Can I increase reduce latency / increase the FPS?** \
+  Yes, as long as your network and compositor are fast enough, at the cost of higher CPU usage. Try `xwlrvnc -fps 60 -nodamage vncserver-x11 -CaptureMethod=1 -PollInterval=10 -PollCursorTime=10 -CompareFB=TRUE`, which makes RealVNC do the screen diffing, sends frames at a higher rate, and increases the update interval for client-rendered cursors.
+
+- **Can I completely disable the unsupported VNC Server features?** \
+  Yes, as long as you have a RealVNC subscription which lets you control the required [parameters](https://help.realvnc.com/hc/en-us/articles/360002251297-RealVNC-Server-Parameter-Reference#permissions-0-80). Try adding `-ConnNotifyTimeout=0 -DisableTrayIcon=2 -EnableChat=FALSE -QueryConnect=FALSE -RecordQuery=FALSE` to the `vncserver-x11` arguments. This isn't really necessary though, those features will just do nothing if enabled since the GUI stuff is stubbed out.
 
 - TODO: more

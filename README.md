@@ -1,4 +1,4 @@
-# xrvncwrap
+# xwlrvnc
 
 Fake X server backed by a Wayland display, implementing just enough for RealVNC to work on it.
 
@@ -6,18 +6,20 @@ The initial version was mostly vibe-coded, but designed and tested by me. This R
 
 Also see [vncagent-wlr-fixes](https://github.com/pgaskin/vncagent-wlr-fixes) for an alternative approach I tried to fix RealVNC's experimental Wayland support instead.
 
+You may also be interested in my [fixes and patches](https://github.com/pgaskin/vncpatch) for the RealVNC Android app, including an invisible menu (instead of the gigantic floating toolbar which gets in the way), dark mode support, key repeat support, and a fix for clicks randomly not working on high-frequency touchscreens (e.g., on a Pixel 9 or later).
+
 ### Usage
 
 ```bash
-cargo install xrvncwrap
-xrvncwrap vncserver-x11
+cargo install xwlrvnc
+xwlrvnc vncserver-x11
 
 # usage info
-xrvncwrap -help
+xwlrvnc -help
 
 # on compositors with broken virtual keyboard/pointer (e.g., smithay, niri)
 cargo install wl-uinput-proxy
-wl-uinput-proxy xrvncwrap vncserver-x11
+wl-uinput-proxy xwlrvnc vncserver-x11
 ```
 
 To configure RealVNC, just run it directly under Xwayland, use the cli options, or use a config file.
@@ -55,6 +57,7 @@ The core VNC features, plus some RealVNC extensions work correctly and have been
     - Additional authentication methods.
     - Additional encryption methods.
     - Additional encodings.
+    - File transfer.
 - Performance:
   - Adaptive capture rate for reduced CPU usage.
   - No capture while idle.
@@ -68,14 +71,13 @@ Some things are out-of scope:
   - Status/connection/cloud windows (to configure RealVNC, just temporarily start vncserver-x11 under Xwayland or use the config files/flags).
   - Protocol extensions:
     - Chat.
-    - File transfer.
     - Tray icon.
-  - Screen blanking.
-  - Local input blocking.
 - Extensions:
   - Dynamic resolution (this is only supported by virtual-mode anyways).
 - System-wide VNC server (I might reconsider this in the future).
 - Virtual-mode VNC server (not really needed, just run another instance in a nested wayland compositor).
+
+<!-- screen blanking and local input blocking are also out of scope, but are windows-only anyways -->
 
 The fake X server implements:
 
@@ -89,8 +91,6 @@ The fake X server implements:
 - XDamage (screen damage tracking).
 
 I've tested this against niri 26.04 (with wl-uinput-proxy) and sway 1.11.
-
-This tool also works with x11vnc 0.9.17, but I'm not currently intentionally supporting x11vnc, so it working is a nice coincidence.
 
 ### Compositor requirements
 
