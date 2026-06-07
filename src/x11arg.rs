@@ -156,6 +156,7 @@ macro_rules! define_config {
                     }
                     if name == "version" || name == "v" {
                         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+                        println!("{}", env!("CARGO_PKG_REPOSITORY"));
                         std::process::exit(0);
                     }
                     $(

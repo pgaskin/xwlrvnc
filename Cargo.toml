@@ -3,6 +3,10 @@ name = "xwlrvnc"
 version = "0.0.1"
 edition = "2024"
 license = "MIT"
+description = "Fake X server backed by a Wayland display, implementing just enough for RealVNC to work on it"
+keywords = ["wayland","virtual-input","x11","vnc"]
+categories = ["command-line-utilities"]
+repository = "https://github.com/pgaskin/xwlrvnc"
 
 [dependencies]
 nix = { version = "0.30", features = ["fs"] }
