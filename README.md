@@ -58,6 +58,7 @@ The core VNC features, plus some RealVNC extensions work correctly and have been
     - Additional encryption methods.
     - Additional encodings.
     - File transfer.
+  - TODO: dynamic resolution (needs a LD_PRELOAD hook since it's usually only supported in virtual mode)
 - Performance:
   - Adaptive capture rate for reduced CPU usage.
   - No capture while idle.
@@ -72,8 +73,6 @@ Some things are out-of scope:
   - Protocol extensions:
     - Chat.
     - Tray icon.
-- Extensions:
-  - Dynamic resolution (this is only supported by virtual-mode anyways).
 - System-wide VNC server (I might reconsider this in the future).
 - Virtual-mode VNC server (not really needed, just run another instance in a nested wayland compositor).
 
@@ -112,6 +111,8 @@ The following wayland protocols are used. At least one in each category is requi
   - [`zwlr_data_control_v1`](https://wayland.app/protocols/wlr-data-control-unstable-v1)
 - Client-side cursor (optional)
   - [`ext_image_copy_capture_v1`](https://wayland.app/protocols/ext-image-copy-capture-v1)
+- TODO: Dynamic resolution
+  - TODO: [`zwlr_output_manager_v1`](https://wayland.app/protocols/wlr-output-management-unstable-v1)
 
 If your compositor is has a broken/missing virtual keyboard/pointer implementation (e.g., Smithay-based ones like niri), you'll need to wrap xrvncwrap with [wl-uinput-proxy](https://github.com/pgaskin/wl-uinput-proxy) to work around it using uinput.
 
