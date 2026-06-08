@@ -78,6 +78,8 @@ xwlrvnc -verbose -profile sh -c "for x in 1 2 3; do echo \$x; xwd -root -silent 
 
 ### Log messages
 
+#### xwlrvnc
+
 If you're using `ext_image_copy_capture_v1` and see a mesage like `ext capture frame failed (buffer-constraints)` after changing outputs, it's fine as long as it also doesn't stop working.
 
 If you see a warning about `client selected events we don't deliver`, it's usually harmless unless your problem is directly related to a listed event.
@@ -85,6 +87,10 @@ If you see a warning about `client selected events we don't deliver`, it's usual
 If you see a message like `unhandled request`, it needs to either be stubbed or implemented in [x11/conn.rs](../src/x11/conn.rs). The client is likely to hang after this since it'll probably be waiting for a reply.
 
 <!-- TODO: I should add a lot more logging, especially around wayland protocol selection -->
+
+#### RealVNC
+
+To get more verbose logs, add the `-Log *:stderr:100` RealVNC parameter. You can also filter the logs (`-Log` is comma-separated), see `vncserver-x11 -help all`.
 
 ### Performance issues
 
@@ -103,6 +109,9 @@ TODO: more info
 
 ### FAQ
 
+- **How is this different than Xwayland?** \
+  It's not based on the xserver source code (it's entirely from scratch), and its only purpose is to bridge the outputs/screen/clipboard/keyboard/keymap/pointer/cursor to Wayland, and only what's needed by RealVNC. It does not support any window-management or drawing features.
+
 - **How do I configure RealVNC?** \
   Either use the config file, CLI parameters, or start vncserver under Xwayland temporarily to access the GUI.
 
@@ -120,5 +129,8 @@ TODO: more info
 
 - **Can I completely disable the unsupported VNC Server features?** \
   Yes, as long as you have a RealVNC subscription which lets you control the required [parameters](https://help.realvnc.com/hc/en-us/articles/360002251297-RealVNC-Server-Parameter-Reference#permissions-0-80). Try adding `-ConnNotifyTimeout=0 -DisableTrayIcon=2 -EnableChat=FALSE -QueryConnect=FALSE -RecordQuery=FALSE` to the `vncserver-x11` arguments. This isn't really necessary though, those features will just do nothing if enabled since the GUI stuff is stubbed out.
+
+- **Can I show a single monitor only?** \
+  Yes, use the `-Monitor` RealVNC parameter. The XRandR output names match Wayland (you can check them with your compositor, or using `xwlrvnc xrandr --query`).
 
 - TODO: more
