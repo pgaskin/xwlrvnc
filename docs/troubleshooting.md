@@ -118,8 +118,8 @@ TODO: more info
 - **How do I stop my selection from constantly getting copied?** \
   RealVNC merges the two clipboards. You can inhibit the primary (i.e., selection) clipboard by adding the `-noprimary` option.
 
-- **Why doesn't *\<realvnc feature\>* work?** \
-  Check the comprehensive list of supported features in the [README](../README.md#features).
+- **Why doesn't *\<RealVNC feature\>* work?** \
+  Check the comprehensive list of supported features in the [README](../README.md#features). Also, ensure your RealVNC license supports the feature you're trying to use.
 
 - **Can I use this with other VNC servers?** \
   Maybe. It has worked with x11vnc 0.9.17. I don't know why you'd want to, though, when [w0vncserver](https://tigervnc.org/doc/w0vncserver.html) exists. The point of this project was to get the closed-source RealVNC and its proprietary extensions working on Wayland.
@@ -132,5 +132,8 @@ TODO: more info
 
 - **Can I show a single monitor only?** \
   Yes, use the `-Monitor` RealVNC parameter. The XRandR output names match Wayland (you can check them with your compositor, or using `xwlrvnc xrandr --query`).
+
+- **Can I run multiple instances of RealVNC?** \
+  Yes, use the `-RfbPort` parameter to change the listen port, and also add `-newinstance` to the end of the `vncserver-x11` command.
 
 - TODO: more
