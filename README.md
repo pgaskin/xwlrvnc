@@ -120,4 +120,19 @@ If your compositor is has a broken/missing virtual keyboard/pointer implementati
 
 I'll probably add support for other capture/input protocols later, and maybe also xdg-desktop-portal.
 
+### TODO
+
+- In progress
+  - Refactor everything and clean up Claude's mess.
+  - Make startup more deterministic.
+  - Add options for pointer/keyboard input protocol.
+  - Implement `RandrSetScreenSize` and `RandrSetCrtcConfig` with `zwlr_output_manager_v1` for dynamic resolution support.
+  - Better logging.
+
+- Future
+  - See if we can make input work on headless compositors with no existing seats.
+  - Maybe make a launcher script and systemd unit for RealVNC.
+  - Support input via `libei`.
+  - Maybe support capture via `xdg-desktop-portal`.
+
 <!-- TODO: probably slim down the readme and put more in docs -->
