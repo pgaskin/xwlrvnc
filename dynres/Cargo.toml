@@ -1,0 +1,22 @@
+[package]
+name = "rvnc-dynres-hook"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+name = "rvnc_dynres_hook"
+crate-type = ["cdylib"]
+
+[profile.dev]
+panic = "abort"
+strip = "symbols"
+
+[profile.release]
+panic = "abort"   # no unwind for no_std cdylib
+opt-level = "z"
+strip = "symbols"
+
+[dependencies]
+hex = { version = "0.4.3", default-features = false }
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "mm", "param", "stdio"] }

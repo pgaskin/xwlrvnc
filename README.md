@@ -24,6 +24,8 @@ wl-uinput-proxy xwlrvnc vncserver-x11
 
 To configure RealVNC, just run it directly under Xwayland, use the cli options, or use a config file.
 
+If you plan to use `-dynres` to enable dynamic resolutions, you'll also need to [install the hook](./dynres/README.md).
+
 ### Documentation
 
 - [Troubleshooting](./docs/troubleshooting.md)
@@ -58,7 +60,7 @@ The core VNC features, plus some RealVNC extensions work correctly and have been
     - Additional encryption methods.
     - Additional encodings.
     - File transfer.
-  - TODO: dynamic resolution (needs a LD_PRELOAD hook since it's usually only supported in virtual mode)
+  - TODO: Dynamic resolution (if enabled, needs a [hook](./dynres/))
 - Performance:
   - Adaptive capture rate for reduced CPU usage.
   - No capture while idle.
@@ -111,7 +113,7 @@ The following wayland protocols are used. At least one in each category is requi
   - [`zwlr_data_control_v1`](https://wayland.app/protocols/wlr-data-control-unstable-v1)
 - Client-side cursor (optional)
   - [`ext_image_copy_capture_v1`](https://wayland.app/protocols/ext-image-copy-capture-v1)
-- TODO: Dynamic resolution
+- Dynamic resolution
   - TODO: [`zwlr_output_manager_v1`](https://wayland.app/protocols/wlr-output-management-unstable-v1)
 
 If your compositor is has a broken/missing virtual keyboard/pointer implementation (e.g., Smithay-based ones like niri), you'll need to wrap xrvncwrap with [wl-uinput-proxy](https://github.com/pgaskin/wl-uinput-proxy) to work around it using uinput.

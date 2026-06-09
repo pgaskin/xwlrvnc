@@ -28,3 +28,6 @@ xkbcommon-rs = { version = "0.1.2", features = ["client", "server"] }
 # resolve our frames. No runtime cost; just a larger binary.
 [profile.release]
 debug = true
+
+[workspace]
+exclude = ["dynres-hook"] # can't do the profile options otherwise
