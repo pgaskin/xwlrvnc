@@ -1,10 +1,9 @@
 //! The runtime configuration: backend choices and the wrapped command, parsed
 //! X11-style from the command line. The parser, help text and `ArgEnum` trait
-//! live in [`crate::x11arg`]; this module just defines the option enums and the
-//! [`Config`] fields they're generated from.
+//! live in [`crate::util::args`]; this module just defines the option enums and
+//! the [`Config`] fields they're generated from.
 
-use crate::x11::Geometry;
-use crate::x11arg::ArgEnum;
+use crate::util::{ArgEnum, Geometry};
 
 define_config! {
     pub struct Config {

@@ -14,16 +14,38 @@
 //! is a button.
 
 use std::os::fd::BorrowedFd;
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use wayland_client::Connection;
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
-use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
-use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
+
+use crate::util::{Layout, OutputRect};
 use xkbcommon_rs::xkb_state::{KeyDirection, StateComponent};
 use xkbcommon_rs::{Context, Keymap, KeymapFormat, State};
+
+/// A virtual pointer device, abstracted over the Wayland protocol that backs it
+/// (currently `zwlr_virtual_pointer_v1`; a libei backend is planned). Methods
+/// mirror the wl_pointer requests we emit; the implementor batches them into a
+/// `frame`.
+pub trait VirtualPointer: Send + Sync {
+    fn motion_absolute(&self, time: u32, x: u32, y: u32, extent_x: u32, extent_y: u32);
+    fn motion(&self, time: u32, dx: f64, dy: f64);
+    fn button(&self, time: u32, button: u32, state: ButtonState);
+    fn axis(&self, time: u32, axis: Axis, value: f64);
+    fn axis_source(&self, source: AxisSource);
+    fn axis_discrete(&self, time: u32, axis: Axis, value: f64, discrete: i32);
+    fn frame(&self);
+}
+
+/// A virtual keyboard device, abstracted over the backing Wayland protocol
+/// (currently `zwp_virtual_keyboard_v1`).
+pub trait VirtualKeyboard: Send + Sync {
+    fn keymap(&self, format: u32, fd: BorrowedFd, size: u32);
+    fn key(&self, time: u32, key: u32, state: u32);
+    fn modifiers(&self, depressed: u32, latched: u32, locked: u32, group: u32);
+}
 
 // XTest/core input event types (from X.h).
 pub const KEY_PRESS: u8 = 2;
@@ -63,33 +85,10 @@ pub struct Input {
     layout: Mutex<Option<Layout>>,
 }
 
-/// One output's physical (X-screen) rect paired with its logical (compositor)
-/// rect, for remapping absolute pointer coordinates.
-#[derive(Clone, Copy)]
-pub struct OutputRect {
-    pub px: i32,
-    pub py: i32,
-    pub pw: i32,
-    pub ph: i32,
-    pub lx: i32,
-    pub ly: i32,
-    pub lw: i32,
-    pub lh: i32,
-}
-
-struct Layout {
-    outputs: Vec<OutputRect>,
-    /// Logical bounding box (origin + size) of all outputs.
-    ox: i32,
-    oy: i32,
-    ow: i32,
-    oh: i32,
-}
-
 struct Backend {
     conn: Connection,
-    pointer: ZwlrVirtualPointerV1,
-    keyboard: ZwpVirtualKeyboardV1,
+    pointer: Box<dyn VirtualPointer>,
+    keyboard: Box<dyn VirtualKeyboard>,
     /// The virtual keyboard rejects `key` requests until a keymap is set.
     keymap_set: AtomicBool,
 }
@@ -111,8 +110,8 @@ impl Input {
     pub fn set_devices(
         &self,
         conn: Connection,
-        pointer: ZwlrVirtualPointerV1,
-        keyboard: ZwpVirtualKeyboardV1,
+        pointer: Box<dyn VirtualPointer>,
+        keyboard: Box<dyn VirtualKeyboard>,
     ) {
         let _ = self.backend.set(Backend {
             conn,
@@ -153,7 +152,11 @@ impl Input {
     fn update_modifiers(&self, b: &Backend, x_keycode: u8, press: bool) {
         let mut guard = self.xkb.lock().unwrap();
         let Some(state) = guard.as_mut() else { return };
-        let dir = if press { KeyDirection::Down } else { KeyDirection::Up };
+        let dir = if press {
+            KeyDirection::Down
+        } else {
+            KeyDirection::Up
+        };
         // xkb keycode == X keycode == evdev + 8, so pass `detail` unshifted.
         let kc = u32::from(x_keycode);
         // xkbcommon-rs panics ("Key has no valid layout") inside update_key for
@@ -181,14 +184,7 @@ impl Input {
     /// Installs the physical↔logical output layout used to remap absolute
     /// pointer motion. Called by the Wayland thread whenever outputs change.
     pub fn set_layout(&self, outputs: Vec<OutputRect>) {
-        let layout = (!outputs.is_empty()).then(|| {
-            let ox = outputs.iter().map(|o| o.lx).min().unwrap_or(0);
-            let oy = outputs.iter().map(|o| o.ly).min().unwrap_or(0);
-            let mx = outputs.iter().map(|o| o.lx + o.lw).max().unwrap_or(0);
-            let my = outputs.iter().map(|o| o.ly + o.lh).max().unwrap_or(0);
-            Layout { outputs, ox, oy, ow: (mx - ox).max(1), oh: (my - oy).max(1) }
-        });
-        *self.layout.lock().unwrap() = layout;
+        *self.layout.lock().unwrap() = Layout::new(outputs);
     }
 
     fn time(&self) -> u32 {
@@ -239,7 +235,8 @@ impl Input {
                 let t = self.time();
                 b.pointer.axis_source(AxisSource::Wheel);
                 b.pointer.axis(t, axis, f64::from(discrete) * WHEEL_NOTCH);
-                b.pointer.axis_discrete(t, axis, f64::from(discrete) * WHEEL_NOTCH, discrete);
+                b.pointer
+                    .axis_discrete(t, axis, f64::from(discrete) * WHEEL_NOTCH, discrete);
                 b.pointer.frame();
             }
             return;
@@ -255,7 +252,11 @@ impl Input {
                 return;
             }
         };
-        let state = if press { ButtonState::Pressed } else { ButtonState::Released };
+        let state = if press {
+            ButtonState::Pressed
+        } else {
+            ButtonState::Released
+        };
         b.pointer.button(self.time(), code, state);
         b.pointer.frame();
     }
@@ -266,7 +267,13 @@ impl Input {
         // output scaling. The virtual pointer maps the value/extent fraction
         // over the logical output layout, so feeding physical coords with a
         // physical extent would misplace the cursor on scaled outputs.
-        if let Some((lx, ly, lw, lh)) = self.to_logical(x, y) {
+        if let Some((lx, ly, lw, lh)) = self
+            .layout
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|l| l.to_logical(x, y))
+        {
             b.pointer.motion_absolute(self.time(), lx, ly, lw, lh);
             b.pointer.frame();
             return;
@@ -276,44 +283,9 @@ impl Input {
         let h = self.height.load(Ordering::Relaxed).max(0);
         let cx = i32::from(x).clamp(0, w) as u32;
         let cy = i32::from(y).clamp(0, h) as u32;
-        b.pointer.motion_absolute(self.time(), cx, cy, w as u32, h as u32);
+        b.pointer
+            .motion_absolute(self.time(), cx, cy, w as u32, h as u32);
         b.pointer.frame();
-    }
-
-    /// Converts a physical X-screen point to `(value_x, value_y, extent_x,
-    /// extent_y)` in the compositor's logical space, normalised to the logical
-    /// bounding-box origin. Returns `None` if no layout is installed.
-    fn to_logical(&self, x: i16, y: i16) -> Option<(u32, u32, u32, u32)> {
-        let guard = self.layout.lock().unwrap();
-        let layout = guard.as_ref()?;
-        let (px, py) = (i32::from(x), i32::from(y));
-        // Prefer the output whose physical rect contains the point; otherwise
-        // (a gap below a shorter output, or out of bounds) pick the nearest by
-        // clamped distance so motion still resolves somewhere sensible.
-        let inside = layout
-            .outputs
-            .iter()
-            .find(|o| px >= o.px && px < o.px + o.pw && py >= o.py && py < o.py + o.ph);
-        let o = inside.or_else(|| {
-            layout.outputs.iter().min_by_key(|o| {
-                let dx = px - px.clamp(o.px, o.px + o.pw - 1);
-                let dy = py - py.clamp(o.py, o.py + o.ph - 1);
-                dx * dx + dy * dy
-            })
-        })?;
-        // Local physical offset → local logical offset (lw/pw == 1/scale).
-        let off = |p: i32, base: i32, plen: i32, llen: i32| -> i32 {
-            let plen = plen.max(1);
-            (i64::from((p - base).clamp(0, plen - 1)) * i64::from(llen) / i64::from(plen)) as i32
-        };
-        let gx = o.lx + off(px, o.px, o.pw, o.lw) - layout.ox;
-        let gy = o.ly + off(py, o.py, o.ph, o.lh) - layout.oy;
-        Some((
-            gx.clamp(0, layout.ow) as u32,
-            gy.clamp(0, layout.oh) as u32,
-            layout.ow as u32,
-            layout.oh as u32,
-        ))
     }
 
     /// Relative motion is forwarded as a relative wl_pointer motion; the proxy

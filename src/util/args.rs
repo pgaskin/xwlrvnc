@@ -1,12 +1,13 @@
 //! A small X11-style argument parser, generated from a struct definition.
 //!
-//! X servers take single-dash long options (`-display`, `-nolisten`) and stop at
-//! the first non-option argument. clap can't express that, so [`define_config!`]
-//! generates a config struct, its parser, and `-help` text (formatted like
-//! `Xwayland -help`) straight from the field definitions: the option name is the
-//! field name with `_`→`-`, matched case-insensitively, and value/flag handling
-//! follows the field's kind. Everything after the first non-option argument (or a
-//! `--`) is the command to run. Values may be given as `-opt value` or `-opt=value`.
+//! X servers take single-dash long options (`-display`, `-nolisten`) and stop
+//! at the first non-option argument. clap can't express that, so
+//! [`define_config!`] generates a config struct, its parser, and `-help` text
+//! (formatted like `Xwayland -help`) straight from the field definitions: the
+//! option name is the field name with `_` replaced with `-`, matched
+//! case-insensitively, and value/flag handling follows the field's kind.
+//! Everything after the first non-option argument (or a `--`) is the command to
+//! run. Values may be given as `-opt value` or `-opt=value`.
 
 /// A fixed-choice option value (an enum), for the `choice` field kind.
 pub trait ArgEnum: Sized + Copy {
@@ -32,7 +33,7 @@ macro_rules! arg_default {
         ::core::option::Option::None
     };
     ($ty:ty, choice, $def:literal) => {
-        <$ty as $crate::x11arg::ArgEnum>::from_arg($def).expect("invalid default")
+        <$ty as $crate::util::ArgEnum>::from_arg($def).expect("invalid default")
     };
 }
 
@@ -45,7 +46,11 @@ macro_rules! arg_usage {
         format!("-{} {}", opt_name!($field), $vn)
     };
     ($ty:ty, choice, $field:ident, $def:literal) => {
-        format!("-{} [{}]", opt_name!($field), <$ty as $crate::x11arg::ArgEnum>::VARIANTS.join("|"))
+        format!(
+            "-{} [{}]",
+            opt_name!($field),
+            <$ty as $crate::util::ArgEnum>::VARIANTS.join("|")
+        )
     };
 }
 
@@ -85,7 +90,7 @@ macro_rules! arg_apply {
     }};
     ($ty:ty, choice, $field:ident, $inline:ident, $argv:ident, $i:ident, $prog:ident, $def:literal) => {{
         let raw = take_value!($inline, $argv, $i, $prog, $field);
-        match <$ty as $crate::x11arg::ArgEnum>::from_arg(&raw) {
+        match <$ty as $crate::util::ArgEnum>::from_arg(&raw) {
             ::core::option::Option::Some(v) => $field = v,
             ::core::option::Option::None => Self::usage_error(
                 &$prog,
@@ -93,7 +98,7 @@ macro_rules! arg_apply {
                     "invalid value {:?} for -{} (expected one of: {})",
                     raw,
                     opt_name!($field),
-                    <$ty as $crate::x11arg::ArgEnum>::VARIANTS.join(", "),
+                    <$ty as $crate::util::ArgEnum>::VARIANTS.join(", "),
                 ),
             ),
         }

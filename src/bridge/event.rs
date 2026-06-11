@@ -7,17 +7,17 @@
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use x11rb_protocol::protocol::{randr, render, xfixes, xproto};
 use x11rb_protocol::x11_utils::Serialize;
 
-use crate::clipboard::Sel;
-use crate::x11::ROOT_WINDOW;
-use crate::x11::ext;
+use crate::bridge::clipboard::Sel;
+use crate::bridge::x11::ROOT_WINDOW;
+use crate::bridge::x11::ext::EXTENSIONS;
 
 /// A client's XFixes registration to be notified about a selection's owner.
 struct SelReg {
@@ -72,7 +72,10 @@ pub struct Client {
 impl Client {
     pub fn new(writer: UnixStream) -> Self {
         Self {
-            writer: Mutex::new(SeqWriter { stream: writer, last_seq: 0 }),
+            writer: Mutex::new(SeqWriter {
+                stream: writer,
+                last_seq: 0,
+            }),
             seq: AtomicU16::new(0),
             randr_window: AtomicU32::new(0),
             selections: Mutex::new(Vec::new()),
@@ -163,7 +166,7 @@ impl EventSink {
     /// selected StructureNotify on the root (vncagent uses the latter, not RandR,
     /// to detect resizes).
     pub fn screen_changed(&self, width: u16, height: u16, timestamp: u32, config_timestamp: u32) {
-        let first_event = ext::lookup(b"RANDR").map_or(0, |e| e.first_event);
+        let first_event = EXTENSIONS.lookup(b"RANDR").map_or(0, |e| e.first_event);
         let mut clients = self.clients.lock().unwrap();
         clients.retain(|c| !c.dead.load(Ordering::Relaxed));
         for c in clients.iter() {
@@ -208,8 +211,8 @@ impl EventSink {
 
     /// Sends XFixesCursorNotify to clients that called SelectCursorInput.
     pub fn cursor_changed(&self, serial: u32) {
-        let first_event = ext::lookup(b"XFIXES").map_or(0, |e| e.first_event);
-        let timestamp = crate::event::server_time_ms();
+        let first_event = EXTENSIONS.lookup(b"XFIXES").map_or(0, |e| e.first_event);
+        let timestamp = server_time_ms();
         let mut clients = self.clients.lock().unwrap();
         clients.retain(|c| !c.dead.load(Ordering::Relaxed));
         for c in clients.iter() {
@@ -232,7 +235,7 @@ impl EventSink {
 
     /// Sends XFixesSelectionNotify (owner changed) to clients watching `kind`.
     pub fn selection_changed(&self, kind: Sel, owner: u32, timestamp: u32) {
-        let first_event = ext::lookup(b"XFIXES").map_or(0, |e| e.first_event);
+        let first_event = EXTENSIONS.lookup(b"XFIXES").map_or(0, |e| e.first_event);
         let mut clients = self.clients.lock().unwrap();
         clients.retain(|c| !c.dead.load(Ordering::Relaxed));
         for c in clients.iter() {

@@ -1,11 +1,6 @@
-//! A fake X11 server that backs `vncagent-x11` (RealVNC's Wayland-less agent)
-//! with wlr-screencopy for the screen, the wlr virtual-pointer / zwp
-//! virtual-keyboard protocols for input, and the Wayland data-control protocol
-//! for the clipboard.
-//!
-//! Usage: `xwlrvnc vncagent-x11 [args...]` — we pick a free X display, point the
-//! wrapped binary's `DISPLAY` at ourselves, and translate its X protocol into
-//! Wayland.
+//! Fake X11 server that implements enough for RealVNC's vncagent-x11 (and most
+//! other VNC server implementations) to work on wayland with screen capture,
+//! virtual input, and clipboard synchronization.
 
 /// Logging verbosity: 0 = quiet (warnings only), 1 = normal, 2 = verbose. Set
 /// once at startup from `-quiet`/`-verbose`.
@@ -26,23 +21,18 @@ macro_rules! log { ($($arg:tt)*) => { $crate::logat!(1, $($arg)*) }; }
 macro_rules! warning {
     ($($arg:tt)*) => { eprintln!("xwlrvnc: {}", format_args!($($arg)*)) };
 }
-/// Verbose detail (shown only with `-verbose`).
+/// Unimplemented (and not explicitly stubbed) request/feature (always shown).
+macro_rules! fixme {
+    ($($arg:tt)*) => { eprintln!("xwlrvnc: fixme: {}", format_args!($($arg)*)) };
+}
+/// Verbose log (shown only with `-verbose`).
 macro_rules! vlog { ($($arg:tt)*) => { $crate::logat!(2, $($arg)*) }; }
-pub(crate) use {log, logat, vlog, warning};
+pub(crate) use {fixme, log, logat, vlog, warning};
 
 #[macro_use]
-mod x11arg;
-mod capture;
-mod clipboard;
+mod util;
+mod bridge;
 mod config;
-mod cursor;
-mod damage;
-mod event;
-mod input;
-mod keymap;
-mod prof;
-mod wayland;
-mod x11;
 
 use std::ffi::CString;
 use std::os::linux::net::SocketAddrExt;
@@ -52,46 +42,46 @@ use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{fs, io, process, ptr, thread};
 
+use crate::bridge::Server;
+use crate::bridge::input::Input;
+use crate::bridge::x11::conn::Connection;
+use crate::bridge::x11::randr::Screen;
 use crate::config::Config;
-use crate::input::Input;
-use crate::x11::conn::{Connection, Server};
-use crate::x11::screen::Screen;
 
-/// The wrapped child's pid (0 until spawned), so the signal handler can forward
-/// the terminating signal to it.
-static CHILD_PID: AtomicI32 = AtomicI32::new(0);
-/// Pointer to a leaked C string of the filesystem X socket path, for the signal
-/// handler to `unlink`. Null until we've bound a display.
-static SOCKET_PATH: AtomicPtr<nix::libc::c_char> = AtomicPtr::new(ptr::null_mut());
+static CHILD_PID: AtomicI32 = AtomicI32::new(0); // for forwarding signals
+static SOCKET_PATH: AtomicPtr<nix::libc::c_char> = AtomicPtr::new(ptr::null_mut()); // leaked C string, to unlink on termination, null until display is bound
 
-/// Async-signal-safe terminating-signal handler. If the child exists, forward
-/// the signal to it and return: the main thread is blocked in `child.wait()`,
-/// which then returns and runs the normal cleanup — i.e. we wait for the child
-/// to exit before exiting ourselves. Only if the signal arrives before the child
-/// is spawned (nothing to wait for) do we clean up and exit here directly.
-/// `kill`/`unlink`/`_exit` are all async-signal-safe and the socket path is a
-/// preallocated C string, so this allocates nothing.
+/// Async-signal-safe (does not allocate) terminating-signal handler. If the
+/// child exists, forward the signal to it and return: the main thread is
+/// blocked in `child.wait()`, which then returns and runs the normal cleanup
+/// (i.e. we wait for the child to exit before exiting ourselves). If the signal
+/// arrives before the child is spawned (nothing to wait for), we clean up and
+/// exit here directly.
 extern "C" fn handle_term(sig: nix::libc::c_int) {
     let pid = CHILD_PID.load(Ordering::Acquire);
     if pid > 0 {
+        // SAFETY: does not allocate
         unsafe { nix::libc::kill(pid, sig) };
         return;
     }
     let path = SOCKET_PATH.load(Ordering::Acquire);
     if !path.is_null() {
+        // SAFETY: does not allocate, path is a leaked C string
         unsafe { nix::libc::unlink(path) };
     }
+    // SAFETY: does not allocate
     unsafe { nix::libc::_exit(128 + sig) };
 }
 
-/// Installs [`handle_term`] for SIGINT/SIGTERM/SIGHUP and records the socket path
-/// it should clean up. The child resets signal dispositions to default on exec,
-/// so this only affects us, not the wrapped program.
 fn install_cleanup(socket_path: &str) {
-    let leaked = CString::new(socket_path).expect("socket path has no NUL").into_raw();
+    let leaked = CString::new(socket_path)
+        .expect("socket path has no NUL")
+        .into_raw();
     SOCKET_PATH.store(leaked, Ordering::Release);
     unsafe {
         let mut sa: nix::libc::sigaction = std::mem::zeroed();
+        // This only affects us since the child will reset signal dispositions
+        // on exec.
         sa.sa_sigaction = handle_term as extern "C" fn(nix::libc::c_int) as usize;
         nix::libc::sigemptyset(&mut sa.sa_mask);
         for sig in [nix::libc::SIGINT, nix::libc::SIGTERM, nix::libc::SIGHUP] {
@@ -103,7 +93,13 @@ fn install_cleanup(socket_path: &str) {
 fn main() {
     let mut config = Config::parse();
     LOG_LEVEL.store(
-        if config.quiet { 0 } else if config.verbose { 2 } else { 1 },
+        if config.quiet {
+            0
+        } else if config.verbose {
+            2
+        } else {
+            1
+        },
         Ordering::Relaxed,
     );
     // Take the command out before `config` moves into the Server (which doesn't
@@ -114,7 +110,7 @@ fn main() {
         process::exit(2);
     }
 
-    prof::start(config.profile);
+    bridge::profile::start(config.profile);
 
     let (display, listeners) = match bind_display(config.display) {
         Ok(v) => v,
@@ -136,23 +132,21 @@ fn main() {
         config,
         screen: Mutex::new(Screen::new(geom.width, geom.height)),
         input,
-        events: event::EventSink::default(),
-        clipboard: clipboard::Clipboard::default(),
-        framebuffer: Arc::new(capture::Framebuffer::default()),
-        damage: damage::DamageSink::default(),
-        cursor: cursor::CursorState::default(),
+        events: bridge::event::EventSink::default(),
+        clipboard: bridge::clipboard::Clipboard::default(),
+        framebuffer: Arc::new(bridge::capture::Framebuffer::default()),
+        damage: bridge::damage::DamageSink::default(),
+        cursor: bridge::cursor::CursorState::default(),
         keymap: Mutex::new(None),
     });
 
-    wayland::spawn(server.clone());
+    bridge::wayland::spawn(server.clone());
 
     for listener in listeners {
         let server = server.clone();
         thread::spawn(move || accept_loop(listener, server));
     }
 
-    // Signal readiness by writing the display number to -displayfd (like Xorg),
-    // then closing it so a waiting parent sees EOF.
     if let Some(fd) = displayfd {
         use std::io::Write;
         use std::os::fd::FromRawFd;
@@ -162,8 +156,6 @@ fn main() {
         }
     }
 
-    // With -nowrap there's no child: run until a terminating signal, which the
-    // handler cleans up after (the socket is removed there since CHILD_PID is 0).
     if nowrap {
         crate::log!("running without a command (-nowrap); waiting for a signal");
         loop {
@@ -223,10 +215,6 @@ fn accept_loop(listener: UnixListener, server: Arc<Server>) {
     }
 }
 
-/// Binds the X sockets for a display number and returns its listeners. With
-/// `forced`, only that display is tried (erroring if it's taken); otherwise the
-/// first free number in 20..100 is used. Binds both the filesystem socket and
-/// the abstract socket Xlib prefers on Linux.
 fn bind_display(forced: Option<u32>) -> io::Result<(u32, Vec<UnixListener>)> {
     let _ = fs::create_dir_all("/tmp/.X11-unix");
     let candidates: Vec<u32> = match forced {
@@ -258,5 +246,8 @@ fn bind_display(forced: Option<u32>) -> io::Result<(u32, Vec<UnixListener>)> {
         crate::log!("serving X display :{n}");
         return Ok((n, listeners));
     }
-    Err(io::Error::new(io::ErrorKind::AddrInUse, "no free X display"))
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "no free X display",
+    ))
 }

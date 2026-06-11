@@ -1,17 +1,24 @@
-//! The screen/RandR model: a set of outputs, each with its own CRTC at a
-//! position in the virtual screen, driving a mode. The screen size is the
-//! bounding box of all connected outputs. Shared (behind a mutex) because RandR
-//! and Wayland output changes both mutate it and it drives pointer scaling.
+use std::collections::BTreeMap;
 
 use x11rb_protocol::protocol::randr::{ModeFlag, ModeInfo};
 
-const FIRST_ID: u32 = 0x40;
+use crate::{
+    bridge::x11::RANDR_OUTPUT_BASE,
+    util::{OutputRect, mm},
+};
 
-pub struct Mode {
-    pub info: ModeInfo,
-    pub name: Vec<u8>,
+/// A RandR screen backed by Wayland outputs.
+pub struct Screen {
+    pub width: u16,
+    pub height: u16,
+    pub modes: Vec<Mode>,
+    pub outputs: Vec<Output>,
+    next_id: u32,
+    pub timestamp: u32,
+    pub config_timestamp: u32,
 }
 
+/// An output positioned on a screen.
 pub struct Output {
     pub output_id: u32,
     pub crtc_id: u32,
@@ -32,25 +39,18 @@ pub struct Output {
     pub ly: i32,
     pub lw: i32,
     pub lh: i32,
-    /// Current mode id on this output's CRTC (0 = disabled).
-    pub mode: u32,
-    /// Mode ids this output advertises.
+    pub mode: u32, // 0 is disabled
     pub mode_ids: Vec<u32>,
     pub mm_width: u32,
     pub mm_height: u32,
-    /// The Wayland registry name this output mirrors (0 = synthetic/default).
-    pub wl_name: u32,
+    pub wl_name: u32, // wayland object, or 0 if not
     pub connected: bool,
 }
 
-pub struct Screen {
-    pub width: u16,
-    pub height: u16,
-    pub modes: Vec<Mode>,
-    pub outputs: Vec<Output>,
-    next_id: u32,
-    pub timestamp: u32,
-    pub config_timestamp: u32,
+// A mode for an output.
+pub struct Mode {
+    pub info: ModeInfo,
+    pub name: Vec<u8>,
 }
 
 impl Screen {
@@ -62,7 +62,7 @@ impl Screen {
             height,
             modes: Vec::new(),
             outputs: Vec::new(),
-            next_id: FIRST_ID,
+            next_id: RANDR_OUTPUT_BASE,
             timestamp: 1,
             config_timestamp: 1,
         };
@@ -96,10 +96,9 @@ impl Screen {
         id
     }
 
-    /// Creates a mode and appends it to the global mode list, returning its id.
     pub fn alloc_mode(&mut self, width: u16, height: u16, refresh_mhz: u32) -> u32 {
         let id = self.alloc_id();
-        self.modes.push(make_mode(id, width, height, refresh_mhz));
+        self.modes.push(Mode::new(id, width, height, refresh_mhz));
         id
     }
 
@@ -148,11 +147,14 @@ impl Screen {
     }
 
     pub fn mode_infos(&self) -> Vec<ModeInfo> {
-        self.modes.iter().map(|m| m.info.clone()).collect()
+        self.modes.iter().map(|m| m.info).collect()
     }
 
     pub fn mode_names(&self) -> Vec<u8> {
-        self.modes.iter().flat_map(|m| m.name.iter().copied()).collect()
+        self.modes
+            .iter()
+            .flat_map(|m| m.name.iter().copied())
+            .collect()
     }
 
     pub fn crtc_ids(&self) -> Vec<u32> {
@@ -172,30 +174,28 @@ impl Screen {
             .map(|o| (i32::from(o.x), i32::from(o.y)))
     }
 
-    /// Per-output physical (X-screen) and logical (compositor) rectangles for the
-    /// connected, enabled outputs. Used to remap absolute pointer input from our
-    /// physical-tiled screen back into logical space (correct under scaling).
-    /// Each tuple is `(px, py, pw, ph, lx, ly, lw, lh)`.
-    pub fn layout_rects(&self) -> Vec<(i32, i32, i32, i32, i32, i32, i32, i32)> {
+    /// Per-output physical (X11 screen) and logical (Wayland compositor)
+    /// rectangles for the connected enabled outputs. Used to remap absolute
+    /// pointer input from the physical-tiled screen back into logical space (so
+    /// it is correct for scaled displays).
+    pub fn layout_rects(&self) -> Vec<OutputRect> {
         self.outputs
             .iter()
             .filter(|o| o.connected && o.mode != 0)
-            .map(|o| {
-                (
-                    i32::from(o.x),
-                    i32::from(o.y),
-                    i32::from(o.width),
-                    i32::from(o.height),
-                    o.lx,
-                    o.ly,
-                    o.lw,
-                    o.lh,
-                )
+            .map(|o| OutputRect {
+                px: i32::from(o.x),
+                py: i32::from(o.y),
+                pw: i32::from(o.width),
+                ph: i32::from(o.height),
+                lx: o.lx,
+                ly: o.ly,
+                lw: o.lw,
+                lh: o.lh,
             })
             .collect()
     }
 
-    /// Reconfigures a CRTC (position + mode). Returns whether geometry changed.
+    /// Reconfigures an output (position + mode), returning true if changed.
     pub fn set_crtc(&mut self, crtc: u32, x: i16, y: i16, mode: u32) -> bool {
         let size = self.mode_size(mode);
         let Some(o) = self.outputs.iter_mut().find(|o| o.crtc_id == crtc) else {
@@ -211,8 +211,8 @@ impl Screen {
         self.recompute_bounds()
     }
 
-    /// Recomputes the screen bounding box from connected, enabled outputs.
-    /// Returns whether it changed.
+    /// Recomputes the X11 screen (i.e., bounding box of all outputs) size for
+    /// connected enabled outputs, returning true if changed.
     pub fn recompute_bounds(&mut self) -> bool {
         let mut w = 0u16;
         let mut h = 0u16;
@@ -236,17 +236,23 @@ impl Screen {
     /// that native-resolution capture buffers tile without overlap, even when
     /// outputs have different (possibly fractional) scales.
     ///
-    /// Logical coordinates only encode the *arrangement*; physical sizes differ
-    /// by scale. We repack each axis independently: walking outputs left-to-right
-    /// (top-to-bottom), an output that begins where a neighbour's logical edge
-    /// ended is placed where that neighbour's *physical* edge ended. This is
-    /// exact for edge-aligned layouts (rows, columns, aligned grids — the only
-    /// sane multi-monitor configs); gaps are bridged 1:1.
+    /// Logical coordinates only encode the arrangement; physical sizes differ
+    /// by scale. We repack each axis independently, walking outputs
+    /// left-to-right (top-to-bottom), so an output that begins where a
+    /// neighbour's logical edge ended is placed where that neighbour's physical
+    /// edge ended. This is exact for edge-aligned layouts (rows, columns,
+    /// aligned grids); gaps are bridged 1:1.
     fn relayout_physical(&mut self) {
-        let xs: Vec<(i32, i32, i32)> =
-            self.outputs.iter().map(|o| (o.lx, o.lw, i32::from(o.width))).collect();
-        let ys: Vec<(i32, i32, i32)> =
-            self.outputs.iter().map(|o| (o.ly, o.lh, i32::from(o.height))).collect();
+        let xs: Vec<(i32, i32, i32)> = self
+            .outputs
+            .iter()
+            .map(|o| (o.lx, o.lw, i32::from(o.width)))
+            .collect();
+        let ys: Vec<(i32, i32, i32)> = self
+            .outputs
+            .iter()
+            .map(|o| (o.ly, o.lh, i32::from(o.height)))
+            .collect();
         let px = pack_axis(&xs);
         let py = pack_axis(&ys);
         let max = i32::from(i16::MAX);
@@ -298,8 +304,13 @@ impl Screen {
                     .iter()
                     .find(|m| m.info.id == o.mode)
                     .is_some_and(|m| m.info.width == width && m.info.height == height);
-                let unchanged = o.lx == lx && o.ly == ly && o.lw == lw && o.lh == lh
-                    && o.width == width && o.height == height && same_mode;
+                let unchanged = o.lx == lx
+                    && o.ly == ly
+                    && o.lw == lw
+                    && o.lh == lh
+                    && o.width == width
+                    && o.height == height
+                    && same_mode;
                 if unchanged {
                     return false;
                 }
@@ -347,15 +358,14 @@ impl Screen {
                     wl_name,
                     connected: true,
                 });
-                // Drop the synthetic default output (and its now-orphaned mode)
-                // now that a real one exists.
+                // drop the fake output now that we have a real one
                 let orphans: Vec<u32> = self
                     .outputs
                     .iter()
-                    .filter(|o| o.wl_name == 0)
+                    .filter(|o| !o.is_wayland())
                     .flat_map(|o| o.mode_ids.iter().copied())
                     .collect();
-                self.outputs.retain(|o| o.wl_name != 0);
+                self.outputs.retain(|o| o.is_wayland());
                 self.modes.retain(|m| {
                     !orphans.contains(&m.info.id)
                         || self.outputs.iter().any(|o| o.mode_ids.contains(&m.info.id))
@@ -380,15 +390,50 @@ impl Screen {
     }
 }
 
-/// Repacks one axis: given each output's `(logical_start, logical_len,
-/// physical_len)`, returns its physical start. See
+impl Output {
+    /// Whether this output mirrors a real Wayland output (`wl_name` 0 is the
+    /// synthetic default we start with before any output is known).
+    fn is_wayland(&self) -> bool {
+        self.wl_name != 0
+    }
+}
+
+impl Mode {
+    fn new(id: u32, width: u16, height: u16, refresh_mhz: u32) -> Self {
+        let name = format!("{width}x{height}").into_bytes();
+        let dot_clock = if refresh_mhz > 0 {
+            (u64::from(width) * u64::from(height) * u64::from(refresh_mhz) / 1000) as u32
+        } else {
+            u32::from(width) * u32::from(height) * 60
+        };
+        let info = ModeInfo {
+            id,
+            width,
+            height,
+            dot_clock,
+            hsync_start: 0,
+            hsync_end: 0,
+            htotal: width,
+            hskew: 0,
+            vsync_start: 0,
+            vsync_end: 0,
+            vtotal: height,
+            name_len: name.len() as u16,
+            mode_flags: ModeFlag::from(0u32),
+        };
+        Self { info, name }
+    }
+}
+
+/// Repacks one axis, given each output's `(logical_start, logical_len,
+/// physical_len)`, returning its physical start. See
 /// [`Screen::relayout_physical`].
 fn pack_axis(items: &[(i32, i32, i32)]) -> Vec<i32> {
-    use std::collections::BTreeMap;
     let mut out = vec![0i32; items.len()];
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by_key(|&i| items[i].0);
-    // Maps a logical coordinate (output edge) to its assigned physical coordinate.
+
+    // map a logical coordinate (output edge) to its assigned physical coordinate
     let mut bound: BTreeMap<i32, i32> = BTreeMap::new();
     if let Some(min_start) = items.iter().map(|&(s, _, _)| s).min() {
         bound.insert(min_start, 0);
@@ -397,7 +442,8 @@ fn pack_axis(items: &[(i32, i32, i32)]) -> Vec<i32> {
         let (ls, llen, plen) = items[i];
         let px = match bound.get(&ls) {
             Some(&p) => p,
-            // No exact boundary (a gap): extend from the nearest known edge 1:1.
+            // no exact boundary (i.e., gap), extend from the nearest known edge
+            // 1:1
             None => match bound.range(..=ls).next_back() {
                 Some((&b, &pb)) => pb + (ls - b),
                 None => 0,
@@ -411,36 +457,4 @@ fn pack_axis(items: &[(i32, i32, i32)]) -> Vec<i32> {
             .or_insert(px + plen);
     }
     out
-}
-
-/// Builds a `ModeInfo` with plausible timings (so a refresh rate is shown) and a
-/// `WxH` name.
-fn make_mode(id: u32, width: u16, height: u16, refresh_mhz: u32) -> Mode {
-    let name = format!("{width}x{height}").into_bytes();
-    let dot_clock = if refresh_mhz > 0 {
-        (u64::from(width) * u64::from(height) * u64::from(refresh_mhz) / 1000) as u32
-    } else {
-        u32::from(width) * u32::from(height) * 60
-    };
-    let info = ModeInfo {
-        id,
-        width,
-        height,
-        dot_clock,
-        hsync_start: 0,
-        hsync_end: 0,
-        htotal: width,
-        hskew: 0,
-        vsync_start: 0,
-        vsync_end: 0,
-        vtotal: height,
-        name_len: name.len() as u16,
-        mode_flags: ModeFlag::from(0u32),
-    };
-    Mode { info, name }
-}
-
-/// Approximate millimeters for a pixel count at 96 DPI.
-fn mm(pixels: u16) -> u32 {
-    u32::from(pixels) * 254 / 960
 }

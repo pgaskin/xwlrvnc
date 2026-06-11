@@ -127,7 +127,7 @@ impl Clipboard {
         let mut g = self.inner.lock().unwrap();
         g.serial = g.serial.wrapping_add(1);
         let serial = g.serial;
-        let ts = crate::event::server_time_ms();
+        let ts = crate::bridge::event::server_time_ms();
         let slot = g.sel_mut(sel);
         let old = slot.offer.take();
         slot.offer = offer;
@@ -182,6 +182,12 @@ impl Clipboard {
 
     /// The data X is serving for `sel` (for a data-control `send`).
     pub fn x_data(&self, sel: Sel) -> Vec<u8> {
-        self.inner.lock().unwrap().x_data.get(&sel).cloned().unwrap_or_default()
+        self.inner
+            .lock()
+            .unwrap()
+            .x_data
+            .get(&sel)
+            .cloned()
+            .unwrap_or_default()
     }
 }

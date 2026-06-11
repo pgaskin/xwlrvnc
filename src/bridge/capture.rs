@@ -36,7 +36,11 @@ struct Fb {
 impl Default for Framebuffer {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(Fb { width: 0, height: 0, data: Vec::new() }),
+            inner: Mutex::new(Fb {
+                width: 0,
+                height: 0,
+                data: Vec::new(),
+            }),
             last_read_ms: AtomicU64::new(0),
         }
     }
@@ -128,7 +132,11 @@ impl Framebuffer {
             if dy < 0 || dy >= fh {
                 continue;
             }
-            let srow = if y_invert { src_height as i32 - 1 - row } else { row };
+            let srow = if y_invert {
+                src_height as i32 - 1 - row
+            } else {
+                row
+            };
             let s = srow as usize * src_stride as usize + src_col;
             let d = dy as usize * dst_stride + dx0 as usize * 4;
             if s + n > src.len() || d + n > fb.data.len() {
@@ -236,6 +244,6 @@ impl Framebuffer {
         }
         let bytes = rows * row_bytes;
         drop(fb);
-        crate::prof::read(bytes, wait_ns, t1.elapsed().as_nanos() as u64);
+        crate::bridge::profile::read(bytes, wait_ns, t1.elapsed().as_nanos() as u64);
     }
 }

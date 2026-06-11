@@ -5,8 +5,8 @@
 //! so it keeps reporting even while the capture or X threads are stalled (which
 //! is exactly the situation we want to catch).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);

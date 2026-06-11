@@ -26,8 +26,7 @@ pub fn build(text: &str) -> Option<Vec<u32>> {
     let level3 = mask("Mod5"); // AltGr
     let levels = [0, shift, level3, shift | level3];
 
-    let mut syms =
-        Vec::with_capacity((MAX_KEYCODE - MIN_KEYCODE + 1) as usize * SYMS_PER as usize);
+    let mut syms = Vec::with_capacity((MAX_KEYCODE - MIN_KEYCODE + 1) as usize * SYMS_PER as usize);
     for kc in MIN_KEYCODE..=MAX_KEYCODE {
         for &m in &levels {
             state.update_mask(m, 0, 0, 0, 0, 0);

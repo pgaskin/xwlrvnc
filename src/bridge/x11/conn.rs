@@ -1,105 +1,50 @@
-//! Per-connection X11 server state and request dispatch.
-
-use std::collections::HashMap;
 use std::io::{self, BufReader, Read};
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use x11rb_protocol::RawFdContainer;
 use x11rb_protocol::protocol::Request;
+use x11rb_protocol::protocol::xproto::{
+    AutoRepeatMode, BackingStore, Depth, EventMask, Format, ImageOrder, Screen, Setup, VisualClass,
+    Visualtype,
+};
 use x11rb_protocol::protocol::{bigreq, damage, randr, render, shm, xfixes, xproto, xtest};
 use x11rb_protocol::x11_utils::{RequestHeader, Serialize, TryParse};
 
-use super::ext::{self, ExtInfo};
-use super::screen::Screen;
-use super::{Geometry, ROOT_COLORMAP, ROOT_DEPTH, ROOT_VISUAL, ROOT_WINDOW, setup, wire};
-use crate::capture::Framebuffer;
-use crate::clipboard::{Clipboard, Sel};
-use crate::cursor::CursorState;
-use crate::damage::DamageSink;
-use crate::event::{Client, EventSink};
-use crate::input::Input;
-
-/// Shared, connection-independent server state.
-pub struct Server {
-    pub config: crate::config::Config,
-    pub screen: Mutex<Screen>,
-    pub input: Arc<Input>,
-    pub events: EventSink,
-    pub clipboard: Clipboard,
-    pub framebuffer: Arc<Framebuffer>,
-    pub damage: DamageSink,
-    pub cursor: CursorState,
-    /// X keysym table built from the compositor keymap (`None` until received).
-    pub keymap: Mutex<Option<Vec<u32>>>,
-}
-
-impl Server {
-    fn geometry(&self) -> Geometry {
-        let s = self.screen.lock().unwrap();
-        Geometry { width: s.width, height: s.height }
-    }
-}
-
-/// One stored window property (for clipboard/WM round-tripping).
-struct Property {
-    type_: u32,
-    format: u8,
-    data: Vec<u8>,
-}
-
-/// The synthetic requestor window used to pull selection data out of an X owner
-/// for the X -> Wayland clipboard direction.
-const FETCH_WINDOW: u32 = 0x0000_016d;
-
-/// The predefined INTEGER atom (Xatom.h), used as the TIMESTAMP property type.
-const INTEGER_ATOM: u32 = 19;
-
-/// An in-flight ConvertSelection we issued to an X selection owner.
-struct Fetch {
-    kind: Sel,
-    property: u32,
-}
-
-/// An in-progress INCR (chunked) receive: the owner is feeding us a large
-/// selection value one property-write at a time. See ICCCM "INCR Properties".
-struct IncrRecv {
-    kind: Sel,
-    property: u32,
-    data: Vec<u8>,
-}
-
-/// A SysV shared-memory segment a client attached via MIT-SHM, that we write
-/// captured pixels into.
-struct ShmSeg {
-    ptr: *mut u8,
-    size: usize,
-}
+use super::atom::Atoms;
+use super::mit_shm::Shm;
+use super::property::{Properties, Property};
+use super::selection::{IncrStep, Selection};
+use super::window::Windows;
+use super::xfixes::Regions;
+use super::{ROOT_COLORMAP, ROOT_DEPTH, ROOT_VISUAL, ROOT_WINDOW};
+use crate::bridge::Server;
+use crate::bridge::clipboard::Sel;
+use crate::bridge::event::Client;
+use crate::bridge::x11::atom::XA_INTEGER;
+use crate::bridge::x11::ext::EXTENSIONS;
+use crate::bridge::x11::{CLIENT_RESOURCE_ID_BASE, SELECTION_FETCH_WINDOW};
+use crate::util::{Geometry, bbox, mm};
 
 pub struct Connection {
     reader: BufReader<UnixStream>,
     client: Arc<Client>,
     server: Arc<Server>,
-    /// Per-connection id (for tracing) and its unique resource-id base.
+    /// Per-connection id (for tracing) and unique resource-id base.
     id: u32,
-    /// Request sequence number; echoed in replies, errors, and events.
+    /// Current request sequence number.
     seq: u16,
-    atoms: AtomTable,
-    properties: HashMap<(u32, u32), Property>,
-    selection_owners: HashMap<u32, u32>,
-    pending_fetch: Option<Fetch>,
-    /// In-progress INCR receive (large selection value arriving in chunks).
-    incr_recv: Option<IncrRecv>,
-    shm_segments: HashMap<u32, ShmSeg>,
+    atoms: Atoms,
+    /// Stored window properties for fake windows (i.e., clipboard/WM).
+    properties: Properties,
+    /// Clipboard/selection state machine (owners, in-flight fetch, INCR receive).
+    selection: Selection,
+    /// MIT-SHM segments the client attached, for ShmGetImage.
+    shm: Shm,
     /// XFixes regions (rectangle lists), keyed by region id.
-    regions: HashMap<u32, Vec<xproto::Rectangle>>,
-    /// Per-window selected event mask (only the bits we act on matter), so we
-    /// know which windows want PropertyNotify. vncagent's clipboard relies on
-    /// PropertyNotify to read a server timestamp (its `gotTime()` helper).
-    window_masks: HashMap<u32, xproto::EventMask>,
-    /// Event-mask bits we've already warned this client selected but don't
-    /// deliver, so the diagnostic fires once per bit rather than every select.
-    warned_event_masks: u32,
+    regions: Regions,
+    /// Per-window selected event masks (for PropertyNotify routing + diagnostics).
+    windows: Windows,
 }
 
 impl Connection {
@@ -115,21 +60,18 @@ impl Connection {
             server,
             id,
             seq: 0,
-            atoms: AtomTable::new(),
-            properties: HashMap::new(),
-            selection_owners: HashMap::new(),
-            pending_fetch: None,
-            incr_recv: None,
-            shm_segments: HashMap::new(),
-            regions: HashMap::new(),
-            window_masks: HashMap::new(),
-            warned_event_masks: 0,
+            atoms: Atoms::default(),
+            properties: Properties::default(),
+            selection: Selection::default(),
+            shm: Shm::default(),
+            regions: Regions::default(),
+            windows: Windows::default(),
         })
     }
 
     pub fn run(mut self) -> io::Result<()> {
         self.handshake()?;
-        while let Some(raw) = wire::read_request(&mut self.reader)? {
+        while let Some(raw) = read_request(&mut self.reader)? {
             self.seq = self.seq.wrapping_add(1);
             self.client.set_seq(self.seq);
             self.dispatch(raw)?;
@@ -148,17 +90,17 @@ impl Connection {
         }
         let name_len = u16::from_le_bytes([head[6], head[7]]) as usize;
         let data_len = u16::from_le_bytes([head[8], head[9]]) as usize;
-        // Consume (and ignore) the authorization name/data; we accept anyone.
+        // Consume and ignore auth data.
         let mut auth = vec![0u8; pad4(name_len) + pad4(data_len)];
         self.reader.read_exact(&mut auth)?;
         // Unique, non-overlapping resource-id base per connection (mask is
         // 0x1fffff = 21 bits, so space each base 0x200000 apart above 0x400000).
-        let base = 0x0040_0000 + self.id * 0x0020_0000;
-        let bytes = setup::build(self.server.geometry(), base);
+        let base = CLIENT_RESOURCE_ID_BASE + self.id * 0x0020_0000;
+        let bytes = setup(self.server.geometry(), base);
         self.client.write_setup(&bytes)
     }
 
-    fn dispatch(&mut self, raw: wire::RawRequest) -> io::Result<()> {
+    fn dispatch(&mut self, raw: RawRequest) -> io::Result<()> {
         let (major, minor) = (raw.major_opcode, raw.minor_opcode);
         let header = RequestHeader {
             major_opcode: raw.major_opcode,
@@ -166,7 +108,7 @@ impl Connection {
             remaining_length: raw.remaining_length,
         };
         let mut fds: Vec<RawFdContainer> = Vec::new();
-        let req = match Request::parse(header, &raw.body, &mut fds, &ExtInfo) {
+        let req = match Request::parse(header, &raw.body, &mut fds, &EXTENSIONS) {
             Ok(req) => req,
             Err(e) => {
                 crate::warning!("failed to parse request {major}.{minor}: {e:?}");
@@ -174,8 +116,7 @@ impl Connection {
             }
         };
 
-        // Full request trace (--xtrace), skipping the high-frequency
-        // capture/input requests so the clipboard/UI request stream is legible.
+        // Full request trace, skipping noisy capture/input requests.
         if self.server.config.xtrace
             && !matches!(
                 req,
@@ -192,17 +133,26 @@ impl Connection {
             // --- atoms ---
             Request::InternAtom(r) => {
                 let atom = self.atoms.intern(&r.name, r.only_if_exists);
-                self.reply(&xproto::InternAtomReply { sequence: 0, length: 0, atom })?;
+                self.reply(&xproto::InternAtomReply {
+                    sequence: 0,
+                    length: 0,
+                    atom,
+                })?;
             }
             Request::GetAtomName(r) => {
                 let name = self.atoms.name(r.atom).unwrap_or(b"").to_vec();
-                self.reply(&xproto::GetAtomNameReply { sequence: 0, length: 0, name })?;
+                self.reply(&xproto::GetAtomNameReply {
+                    sequence: 0,
+                    length: 0,
+                    name,
+                })?;
             }
 
             // --- extensions ---
             Request::QueryExtension(r) => {
                 // Hide DAMAGE when disabled so clients fall back to polling.
-                let e = ext::lookup(&r.name)
+                let e = EXTENSIONS
+                    .lookup(&r.name)
                     .filter(|e| self.server.config.damage() || e.name != "DAMAGE");
                 self.reply(&xproto::QueryExtensionReply {
                     sequence: 0,
@@ -214,12 +164,19 @@ impl Connection {
                 })?;
             }
             Request::ListExtensions(_) => {
-                let names = ext::EXTENSIONS
+                let names = EXTENSIONS
+                    .0
                     .iter()
                     .filter(|e| self.server.config.damage() || e.name != "DAMAGE")
-                    .map(|e| xproto::Str { name: e.name.as_bytes().to_vec() })
+                    .map(|e| xproto::Str {
+                        name: e.name.as_bytes().to_vec(),
+                    })
                     .collect();
-                self.reply(&xproto::ListExtensionsReply { sequence: 0, length: 0, names })?;
+                self.reply(&xproto::ListExtensionsReply {
+                    sequence: 0,
+                    length: 0,
+                    names,
+                })?;
             }
 
             // --- properties / selections (clipboard groundwork) ---
@@ -228,31 +185,32 @@ impl Connection {
                 // chunks onto our fetch window. Each non-empty write is a chunk;
                 // an empty write signals completion. We ack each by deleting the
                 // property (which notifies the owner to send the next chunk).
-                let incr_chunk = self
-                    .incr_recv
-                    .as_ref()
-                    .is_some_and(|i| r.window == FETCH_WINDOW && r.property == i.property);
-                if incr_chunk {
-                    let chunk = r.data.into_owned();
-                    let incr = self.incr_recv.as_mut().unwrap();
-                    if chunk.is_empty() {
-                        let incr = self.incr_recv.take().unwrap();
-                        self.server.clipboard.offer_to_wayland(incr.kind, incr.data);
-                    } else {
-                        incr.data.extend_from_slice(&chunk);
-                        let property = incr.property;
-                        self.property_notify(FETCH_WINDOW, property, xproto::Property::DELETE);
+                if self.selection.incr_chunk(r.window, r.property) {
+                    match self.selection.incr_push(r.data.into_owned()) {
+                        IncrStep::Done(kind, data) => {
+                            self.server.clipboard.offer_to_wayland(kind, data)
+                        }
+                        IncrStep::More(property) => self.property_notify(
+                            SELECTION_FETCH_WINDOW,
+                            property,
+                            xproto::Property::DELETE,
+                        ),
                     }
                     return Ok(());
                 }
-                self.properties.insert(
-                    (r.window, r.property),
-                    Property { type_: r.type_, format: r.format, data: r.data.into_owned() },
+                self.properties.set(
+                    r.window,
+                    r.property,
+                    Property {
+                        type_: r.type_,
+                        format: r.format,
+                        data: r.data.into_owned(),
+                    },
                 );
                 self.property_notify(r.window, r.property, xproto::Property::NEW_VALUE);
             }
             Request::DeleteProperty(r) => {
-                self.properties.remove(&(r.window, r.property));
+                self.properties.remove(r.window, r.property);
                 self.property_notify(r.window, r.property, xproto::Property::DELETE);
             }
             Request::GetProperty(r) => {
@@ -260,21 +218,20 @@ impl Connection {
                 self.reply(&reply)?;
             }
             Request::ListProperties(r) => {
-                let atoms = self
-                    .properties
-                    .keys()
-                    .filter(|(w, _)| *w == r.window)
-                    .map(|(_, a)| *a)
-                    .collect();
-                self.reply(&xproto::ListPropertiesReply { sequence: 0, length: 0, atoms })?;
+                let atoms = self.properties.list(r.window);
+                self.reply(&xproto::ListPropertiesReply {
+                    sequence: 0,
+                    length: 0,
+                    atoms,
+                })?;
             }
             Request::SetSelectionOwner(r) => {
                 if r.owner == 0 {
-                    self.selection_owners.remove(&r.selection);
+                    self.selection.clear_owner(r.selection);
                 } else {
-                    self.selection_owners.insert(r.selection, r.owner);
+                    self.selection.set_owner(r.selection, r.owner);
                     // A real X client took ownership: pull its data into Wayland.
-                    if r.owner != crate::clipboard::OWNER_WINDOW
+                    if r.owner != crate::bridge::clipboard::OWNER_WINDOW
                         && let Some(kind) = self.selection_kind(r.selection)
                     {
                         self.start_fetch(kind, r.selection, r.owner, r.time);
@@ -283,10 +240,10 @@ impl Connection {
             }
             Request::GetSelectionOwner(r) => {
                 // An X client owner wins; otherwise we own it if Wayland has it.
-                let owner = self.selection_owners.get(&r.selection).copied().or_else(|| {
+                let owner = self.selection.owner(r.selection).or_else(|| {
                     self.selection_kind(r.selection)
                         .filter(|k| self.server.clipboard.has(*k))
-                        .map(|_| crate::clipboard::OWNER_WINDOW)
+                        .map(|_| crate::bridge::clipboard::OWNER_WINDOW)
                 });
                 self.reply(&xproto::GetSelectionOwnerReply {
                     sequence: 0,
@@ -301,7 +258,8 @@ impl Connection {
                     let enable = r
                         .event_mask
                         .contains(xfixes::SelectionEventMask::SET_SELECTION_OWNER);
-                    self.client.select_selection(kind, r.selection, r.window, enable);
+                    self.client
+                        .select_selection(kind, r.selection, r.window, enable);
                 }
             }
 
@@ -370,8 +328,8 @@ impl Connection {
             Request::GetKeyboardMapping(r) => {
                 let (per, keysyms) = match self.server.keymap.lock().unwrap().as_ref() {
                     Some(table) => (
-                        crate::keymap::SYMS_PER,
-                        crate::keymap::mapping_slice(table, r.first_keycode, r.count),
+                        crate::bridge::keymap::SYMS_PER,
+                        crate::bridge::keymap::mapping_slice(table, r.first_keycode, r.count),
                     ),
                     // No compositor keymap yet: report one NoSymbol per keycode.
                     None => (1u8, vec![0u32; r.count as usize]),
@@ -409,7 +367,11 @@ impl Connection {
                 })?;
             }
             Request::GetFontPath(_) => {
-                self.reply(&xproto::GetFontPathReply { sequence: 0, length: 0, path: vec![] })?;
+                self.reply(&xproto::GetFontPathReply {
+                    sequence: 0,
+                    length: 0,
+                    path: vec![],
+                })?;
             }
             Request::GetPointerMapping(_) => {
                 // Report 7 buttons (identity mapping). vncagent only synthesizes
@@ -423,7 +385,11 @@ impl Connection {
                 })?;
             }
             Request::QueryKeymap(_) => {
-                self.reply(&xproto::QueryKeymapReply { sequence: 0, length: 0, keys: [0; 32] })?;
+                self.reply(&xproto::QueryKeymapReply {
+                    sequence: 0,
+                    length: 0,
+                    keys: [0; 32],
+                })?;
             }
             Request::GetKeyboardControl(_) => {
                 self.reply(&xproto::GetKeyboardControlReply {
@@ -483,18 +449,13 @@ impl Connection {
                     data,
                 })?;
             }
-            Request::ShmAttach(r) => self.shm_attach(r.shmseg, r.shmid),
-            Request::ShmDetach(r) => {
-                if let Some(seg) = self.shm_segments.remove(&r.shmseg) {
-                    unsafe { nix::libc::shmdt(seg.ptr.cast()) };
-                }
-            }
+            Request::ShmAttach(r) => self.shm.attach(r.shmseg, r.shmid),
+            Request::ShmDetach(r) => self.shm.detach(r.shmseg),
             Request::ShmGetImage(r) => {
-                // Read straight into the client's shared segment — no intermediate
-                // allocation or second copy. (vncagent reads the whole screen this
-                // way ~20×/s, so the extra passes were the dominant CPU cost.)
+                // Read straight into the client's shared segment (vncagent
+                // reads the whole screen this way ~20/sec).
                 let image_size = r.width as usize * r.height as usize * 4;
-                if let Some(seg) = self.shm_segments.get(&r.shmseg) {
+                if let Some(seg) = self.shm.segment(r.shmseg) {
                     let off = (r.offset as usize).min(seg.size);
                     let n = image_size.min(seg.size - off);
                     if n > 0 {
@@ -579,7 +540,11 @@ impl Connection {
                         blue: ((p & 0xff) * 257) as u16,
                     })
                     .collect();
-                self.reply(&xproto::QueryColorsReply { sequence: 0, length: 0, colors })?;
+                self.reply(&xproto::QueryColorsReply {
+                    sequence: 0,
+                    length: 0,
+                    colors,
+                })?;
             }
             Request::ListInstalledColormaps(_) => {
                 self.reply(&xproto::ListInstalledColormapsReply {
@@ -607,13 +572,24 @@ impl Connection {
 
             // --- XTest: the whole point ---
             Request::XtestGetVersion(_) => {
-                self.reply(&xtest::GetVersionReply { major_version: 2, sequence: 0, length: 0, minor_version: 2 })?;
+                self.reply(&xtest::GetVersionReply {
+                    major_version: 2,
+                    sequence: 0,
+                    length: 0,
+                    minor_version: 2,
+                })?;
             }
             Request::XtestCompareCursor(_) => {
-                self.reply(&xtest::CompareCursorReply { same: true, sequence: 0, length: 0 })?;
+                self.reply(&xtest::CompareCursorReply {
+                    same: true,
+                    sequence: 0,
+                    length: 0,
+                })?;
             }
             Request::XtestFakeInput(r) => {
-                self.server.input.fake_input(r.type_, r.detail, r.root_x, r.root_y);
+                self.server
+                    .input
+                    .fake_input(r.type_, r.detail, r.root_x, r.root_y);
             }
             Request::XtestGrabControl(_) => {}
 
@@ -626,7 +602,12 @@ impl Connection {
                 })?;
             }
             Request::RandrQueryVersion(_) => {
-                self.reply(&randr::QueryVersionReply { sequence: 0, length: 0, major_version: 1, minor_version: 6 })?;
+                self.reply(&randr::QueryVersionReply {
+                    sequence: 0,
+                    length: 0,
+                    major_version: 1,
+                    minor_version: 6,
+                })?;
             }
             Request::RandrGetScreenSizeRange(_) => {
                 self.reply(&randr::GetScreenSizeRangeReply {
@@ -639,15 +620,31 @@ impl Connection {
                 })?;
             }
             Request::RandrGetScreenResources(_) => {
-                let (timestamp, config_timestamp, crtcs, outputs, modes, names) = self.screen_resources();
+                let (timestamp, config_timestamp, crtcs, outputs, modes, names) =
+                    self.screen_resources();
                 self.reply(&randr::GetScreenResourcesReply {
-                    sequence: 0, length: 0, timestamp, config_timestamp, crtcs, outputs, modes, names,
+                    sequence: 0,
+                    length: 0,
+                    timestamp,
+                    config_timestamp,
+                    crtcs,
+                    outputs,
+                    modes,
+                    names,
                 })?;
             }
             Request::RandrGetScreenResourcesCurrent(_) => {
-                let (timestamp, config_timestamp, crtcs, outputs, modes, names) = self.screen_resources();
+                let (timestamp, config_timestamp, crtcs, outputs, modes, names) =
+                    self.screen_resources();
                 self.reply(&randr::GetScreenResourcesCurrentReply {
-                    sequence: 0, length: 0, timestamp, config_timestamp, crtcs, outputs, modes, names,
+                    sequence: 0,
+                    length: 0,
+                    timestamp,
+                    config_timestamp,
+                    crtcs,
+                    outputs,
+                    modes,
+                    names,
                 })?;
             }
             Request::RandrGetScreenInfo(_) => {
@@ -658,7 +655,7 @@ impl Connection {
                     let s = self.server.screen.lock().unwrap();
                     (s.width, s.height, s.timestamp, s.config_timestamp)
                 };
-                // Same px→mm approximation we report in ScreenChangeNotify.
+                // Same px->mm approximation as ScreenChangeNotify.
                 let mwidth = (u32::from(width) * 254 / 960) as u16;
                 let mheight = (u32::from(height) * 254 / 960) as u16;
                 self.reply(&randr::GetScreenInfoReply {
@@ -671,9 +668,13 @@ impl Connection {
                     size_id: 0,
                     rotation: randr::Rotation::ROTATE0,
                     rate: 60,
-                    // n_info = n_sizes + rates.len() (x11rb's serialize invariant).
-                    n_info: 2,
-                    sizes: vec![randr::ScreenSize { width, height, mwidth, mheight }],
+                    n_info: 2, // = n_sizes + rates.len()
+                    sizes: vec![randr::ScreenSize {
+                        width,
+                        height,
+                        mwidth,
+                        mheight,
+                    }],
                     rates: vec![randr::RefreshRates { rates: vec![60] }],
                 })?;
             }
@@ -761,10 +762,18 @@ impl Connection {
                     .first()
                     .copied()
                     .unwrap_or(0);
-                self.reply(&randr::GetOutputPrimaryReply { sequence: 0, length: 0, output })?;
+                self.reply(&randr::GetOutputPrimaryReply {
+                    sequence: 0,
+                    length: 0,
+                    output,
+                })?;
             }
             Request::RandrGetCrtcGammaSize(_) => {
-                self.reply(&randr::GetCrtcGammaSizeReply { sequence: 0, length: 0, size: 256 })?;
+                self.reply(&randr::GetCrtcGammaSizeReply {
+                    sequence: 0,
+                    length: 0,
+                    size: 256,
+                })?;
             }
             Request::RandrGetCrtcGamma(_) => {
                 let ramp: Vec<u16> = (0..256).map(|i| (i * 65535 / 255) as u16).collect();
@@ -790,7 +799,11 @@ impl Connection {
                 })?;
             }
             Request::RandrListOutputProperties(_) => {
-                self.reply(&randr::ListOutputPropertiesReply { sequence: 0, length: 0, atoms: vec![] })?;
+                self.reply(&randr::ListOutputPropertiesReply {
+                    sequence: 0,
+                    length: 0,
+                    atoms: vec![],
+                })?;
             }
             Request::RandrGetOutputProperty(_) => {
                 self.reply(&randr::GetOutputPropertyReply {
@@ -814,11 +827,22 @@ impl Connection {
             }
             Request::RandrGetProviders(_) => {
                 let timestamp = self.server.screen.lock().unwrap().timestamp;
-                self.reply(&randr::GetProvidersReply { sequence: 0, length: 0, timestamp, providers: vec![] })?;
+                self.reply(&randr::GetProvidersReply {
+                    sequence: 0,
+                    length: 0,
+                    timestamp,
+                    providers: vec![],
+                })?;
             }
             Request::RandrGetMonitors(_) => {
                 let timestamp = self.server.screen.lock().unwrap().timestamp;
-                self.reply(&randr::GetMonitorsReply { sequence: 0, length: 0, timestamp, n_outputs: 0, monitors: vec![] })?;
+                self.reply(&randr::GetMonitorsReply {
+                    sequence: 0,
+                    length: 0,
+                    timestamp,
+                    n_outputs: 0,
+                    monitors: vec![],
+                })?;
             }
             Request::RandrCreateMode(r) => {
                 let mode = self
@@ -827,13 +851,25 @@ impl Connection {
                     .lock()
                     .unwrap()
                     .create_mode(r.mode_info, r.name.into_owned());
-                self.reply(&randr::CreateModeReply { sequence: 0, length: 0, mode })?;
+                self.reply(&randr::CreateModeReply {
+                    sequence: 0,
+                    length: 0,
+                    mode,
+                })?;
             }
             Request::RandrAddOutputMode(r) => {
-                self.server.screen.lock().unwrap().add_output_mode(r.output, r.mode);
+                self.server
+                    .screen
+                    .lock()
+                    .unwrap()
+                    .add_output_mode(r.output, r.mode);
             }
             Request::RandrDeleteOutputMode(r) => {
-                self.server.screen.lock().unwrap().delete_output_mode(r.output, r.mode);
+                self.server
+                    .screen
+                    .lock()
+                    .unwrap()
+                    .delete_output_mode(r.output, r.mode);
             }
             Request::RandrDestroyMode(r) => {
                 self.server.screen.lock().unwrap().destroy_mode(r.mode);
@@ -854,7 +890,11 @@ impl Connection {
                 })?;
             }
             Request::RandrSetScreenSize(r) => {
-                self.server.screen.lock().unwrap().set_size(r.width, r.height);
+                self.server
+                    .screen
+                    .lock()
+                    .unwrap()
+                    .set_size(r.width, r.height);
                 self.server.input.set_geometry(r.width, r.height);
                 self.notify_screen_change();
             }
@@ -865,18 +905,26 @@ impl Connection {
                 self.client.select_randr(if enabled { r.window } else { 0 });
             }
             Request::DamageQueryVersion(_) => {
-                self.reply(&damage::QueryVersionReply { sequence: 0, length: 0, major_version: 1, minor_version: 1 })?;
+                self.reply(&damage::QueryVersionReply {
+                    sequence: 0,
+                    length: 0,
+                    major_version: 1,
+                    minor_version: 1,
+                })?;
             }
             Request::XfixesQueryVersion(_) => {
-                self.reply(&xfixes::QueryVersionReply { sequence: 0, length: 0, major_version: 5, minor_version: 0 })?;
+                self.reply(&xfixes::QueryVersionReply {
+                    sequence: 0,
+                    length: 0,
+                    major_version: 5,
+                    minor_version: 0,
+                })?;
             }
 
             // --- DAMAGE ---
             Request::DamageCreate(r) => {
-                // No-op when DAMAGE is disabled (we report it absent in
-                // QueryExtension, so a well-behaved client won't get here).
                 if self.server.config.damage() {
-                    crate::prof::damage_create(u8::from(r.level));
+                    crate::bridge::profile::damage_create(u8::from(r.level));
                     self.server.damage.create(
                         self.client.clone(),
                         r.damage,
@@ -889,31 +937,32 @@ impl Connection {
                 self.server.damage.destroy(&self.client, r.damage);
             }
             Request::DamageSubtract(r) => {
-                crate::prof::damage_subtract();
-                let repair = (r.repair != 0).then(|| self.regions.get(&r.repair).cloned().unwrap_or_default());
-                let parts = self.server.damage.subtract(&self.client, r.damage, repair.as_deref());
+                crate::bridge::profile::damage_subtract();
+                let repair = (r.repair != 0).then(|| self.regions.get(r.repair));
+                let parts = self
+                    .server
+                    .damage
+                    .subtract(&self.client, r.damage, repair.as_deref());
                 if r.parts != 0 {
-                    self.regions.insert(r.parts, parts);
+                    self.regions.set(r.parts, parts);
                 }
             }
 
             // --- XFixes regions (enough for the DAMAGE -> region -> fetch flow) ---
             Request::XfixesCreateRegion(r) => {
-                self.regions.insert(r.region, r.rectangles.into_owned());
+                self.regions.set(r.region, r.rectangles.into_owned());
             }
             Request::XfixesSetRegion(r) => {
-                self.regions.insert(r.region, r.rectangles.into_owned());
+                self.regions.set(r.region, r.rectangles.into_owned());
             }
             Request::XfixesDestroyRegion(r) => {
-                self.regions.remove(&r.region);
+                self.regions.destroy(r.region);
             }
             Request::XfixesCopyRegion(r) => {
-                let src = self.regions.get(&r.source).cloned().unwrap_or_default();
-                self.regions.insert(r.destination, src);
+                self.regions.copy(r.source, r.destination);
             }
             Request::XfixesRegionExtents(r) => {
-                let ext = region_extents(self.regions.get(&r.source).map_or(&[][..], Vec::as_slice));
-                self.regions.insert(r.destination, ext.map_or(vec![], |e| vec![e]));
+                self.regions.extents(r.source, r.destination);
             }
             Request::XfixesGetCursorImage(_) => {
                 let c = self.server.cursor.snapshot();
@@ -958,7 +1007,12 @@ impl Connection {
                 })?;
             }
             Request::XfixesGetCursorName(_) => {
-                self.reply(&xfixes::GetCursorNameReply { sequence: 0, length: 0, atom: 0, name: vec![] })?;
+                self.reply(&xfixes::GetCursorNameReply {
+                    sequence: 0,
+                    length: 0,
+                    atom: 0,
+                    name: vec![],
+                })?;
             }
             Request::XfixesGetClientDisconnectMode(_) => {
                 self.reply(&xfixes::GetClientDisconnectModeReply {
@@ -968,9 +1022,18 @@ impl Connection {
                 })?;
             }
             Request::XfixesFetchRegion(r) => {
-                let rects = self.regions.get(&r.region).cloned().unwrap_or_default();
-                let extents = region_extents(&rects).unwrap_or(xproto::Rectangle { x: 0, y: 0, width: 0, height: 0 });
-                self.reply(&xfixes::FetchRegionReply { sequence: 0, extents, rectangles: rects })?;
+                let rects = self.regions.get(r.region);
+                let extents = bbox(&rects).unwrap_or(xproto::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                });
+                self.reply(&xfixes::FetchRegionReply {
+                    sequence: 0,
+                    extents,
+                    rectangles: rects,
+                })?;
             }
             Request::ShmQueryVersion(_) => {
                 self.reply(&shm::QueryVersionReply {
@@ -989,116 +1052,64 @@ impl Connection {
             // windows want PropertyNotify (vncagent's clipboard needs it) ---
             Request::CreateWindow(r) => {
                 if let Some(mask) = r.value_list.event_mask {
-                    self.window_masks.insert(r.wid, mask);
+                    self.windows.set_mask(r.wid, mask);
                     self.track_root_structure(r.wid, mask);
-                    self.warn_unsupported_events(mask);
+                    self.windows.warn_unsupported(mask);
                 }
             }
             Request::ChangeWindowAttributes(r) => {
                 if let Some(mask) = r.value_list.event_mask {
-                    self.window_masks.insert(r.window, mask);
+                    self.windows.set_mask(r.window, mask);
                     self.track_root_structure(r.window, mask);
-                    self.warn_unsupported_events(mask);
+                    self.windows.warn_unsupported(mask);
                 }
             }
             Request::DestroyWindow(r) => {
-                self.window_masks.remove(&r.window);
+                self.windows.remove(r.window);
             }
-
-            // --- requests with no reply that we can safely ignore ---
-            Request::DestroySubwindows(_)
-            | Request::ReparentWindow(_)
-            | Request::MapWindow(_)
-            | Request::MapSubwindows(_)
-            | Request::UnmapWindow(_)
-            | Request::UnmapSubwindows(_)
-            | Request::ConfigureWindow(_)
-            | Request::CirculateWindow(_)
-            | Request::ChangeSaveSet(_)
-            | Request::OpenFont(_)
-            | Request::CloseFont(_)
-            | Request::CreateGC(_)
-            | Request::ChangeGC(_)
-            | Request::CopyGC(_)
-            | Request::SetDashes(_)
-            | Request::SetClipRectangles(_)
-            | Request::FreeGC(_)
-            | Request::CreatePixmap(_)
-            | Request::FreePixmap(_)
-            | Request::CreateColormap(_)
-            | Request::FreeColormap(_)
-            | Request::InstallColormap(_)
-            | Request::UninstallColormap(_)
-            | Request::ClearArea(_)
-            | Request::CopyArea(_)
-            | Request::CopyPlane(_)
-            | Request::PolyPoint(_)
-            | Request::PolyLine(_)
-            | Request::PolySegment(_)
-            | Request::PolyRectangle(_)
-            | Request::PolyArc(_)
-            | Request::FillPoly(_)
-            | Request::PolyFillRectangle(_)
-            | Request::PolyFillArc(_)
-            | Request::PutImage(_)
-            | Request::ImageText8(_)
-            | Request::ImageText16(_)
-            | Request::PolyText8(_)
-            | Request::PolyText16(_)
-            | Request::SetInputFocus(_)
-            | Request::ChangeKeyboardControl(_)
-            | Request::ChangeKeyboardMapping(_)
-            | Request::ChangePointerControl(_)
-            | Request::Bell(_)
-            | Request::GrabServer(_)
-            | Request::UngrabServer(_)
-            | Request::UngrabPointer(_)
-            | Request::UngrabKeyboard(_)
-            | Request::GrabKey(_)
-            | Request::UngrabKey(_)
-            | Request::GrabButton(_)
-            | Request::UngrabButton(_)
-            | Request::ChangeActivePointerGrab(_)
-            | Request::AllowEvents(_)
-            | Request::WarpPointer(_)
-            | Request::SetScreenSaver(_)
-            | Request::ForceScreenSaver(_)
-            | Request::SetCloseDownMode(_)
-            | Request::KillClient(_)
-            | Request::RotateProperties(_)
-            | Request::SetFontPath(_)
-            | Request::NoOperation(_) => {}
             Request::XfixesSelectCursorInput(r) => {
                 let want = u32::from(r.event_mask)
-                    & u32::from(xfixes::CursorNotifyMask::DISPLAY_CURSOR) != 0;
+                    & u32::from(xfixes::CursorNotifyMask::DISPLAY_CURSOR)
+                    != 0;
                 self.client.select_cursor(if want { r.window } else { 0 });
             }
-            // XFixes cursor/region ops we don't need to act on (all void)
-            | Request::XfixesHideCursor(_)
-            | Request::XfixesShowCursor(_)
-            | Request::XfixesSetWindowShapeRegion(_)
-            | Request::XfixesSetPictureClipRegion(_)
-            | Request::XfixesSetGCClipRegion(_)
-            | Request::XfixesUnionRegion(_)
-            | Request::XfixesIntersectRegion(_)
-            | Request::XfixesSubtractRegion(_)
-            | Request::XfixesInvertRegion(_)
-            | Request::XfixesTranslateRegion(_)
-            | Request::XfixesExpandRegion(_)
-            | Request::XfixesCreateRegionFromBitmap(_)
-            | Request::XfixesCreateRegionFromWindow(_)
-            | Request::XfixesCreateRegionFromGC(_)
-            | Request::XfixesCreateRegionFromPicture(_)
-            | Request::XfixesChangeCursor(_)
-            | Request::XfixesChangeCursorByName(_)
-            | Request::XfixesSetCursorName(_)
-            | Request::XfixesChangeSaveSet(_)
-            | Request::XfixesSetClientDisconnectMode(_)
-            | Request::XfixesCreatePointerBarrier(_)
-            | Request::XfixesDeletePointerBarrier(_) => {}
+
+            Request::ChangeKeyboardControl(r) => {
+                if let Some(m) = r.value_list.auto_repeat_mode {
+                    if m == AutoRepeatMode::OFF {
+                        crate::fixme!(
+                            "keyboard auto-repeat cannot be disabled with current wayland interfaces"
+                        )
+                    }
+                }
+                // we don't care about bells or lights
+            }
+
+            Request::MapWindow(_) | Request::ConfigureWindow(_) | Request::UnmapWindow(_) => {
+                // no-op: we don't support windows
+            }
+            Request::CreateGC(_) | Request::ChangeGC(_) | Request::FreeGC(_) => {
+                // no-op: we don't support drawing
+            }
+            Request::OpenFont(_) => {
+                // no-op: we don't support fonts
+            }
 
             other => {
-                crate::warning!("unhandled request {major}.{minor} ({other:?})");
+                // Anything not handled above is potentially something we need
+                // to implement: fail it with a BadImplementation error and log
+                // it as FIXME, and reply with an error if the request wants a
+                // reply (so libxcb doesn't hang).
+                let replied = other.reply_parser().is_some();
+                self.send_error(xproto::IMPLEMENTATION_ERROR, major, u16::from(minor))?;
+                crate::fixme!(
+                    "request {major}.{minor} ({other:?}) is unhandled and needs a stub or implementation, sent error{}",
+                    if replied {
+                        " (instead of a reply)"
+                    } else {
+                        " (no reply expected)"
+                    },
+                );
             }
         }
         Ok(())
@@ -1114,11 +1125,11 @@ impl Connection {
             value_len: 0,
             value: vec![],
         };
-        let Some(p) = self.properties.get(&(r.window, r.property)) else {
+        let Some(p) = self.properties.get(r.window, r.property) else {
             return empty;
         };
         if r.delete {
-            // (kept simple: deletion handled by the caller path if needed)
+            // deletion handled by the caller if needed
         }
         let unit = (p.format / 8).max(1) as usize;
         let start = (r.long_offset as usize * 4).min(p.data.len());
@@ -1137,8 +1148,7 @@ impl Connection {
         }
     }
 
-    /// The common payload of `GetScreenResources`/`GetScreenResourcesCurrent`
-    /// (which have identical layouts): timestamps, crtcs, outputs, modes, names.
+    /// Shared between `GetScreenResources`/`GetScreenResourcesCurrent`.
     fn screen_resources(&self) -> (u32, u32, Vec<u32>, Vec<u32>, Vec<randr::ModeInfo>, Vec<u8>) {
         let s = self.server.screen.lock().unwrap();
         (
@@ -1161,46 +1171,6 @@ impl Connection {
         }
     }
 
-    /// Warns (once per bit, per client) when a client selects event-mask bits we
-    /// never deliver, so gaps surface the same way unhandled requests do. We only
-    /// generate PropertyNotify (clipboard) and root ConfigureNotify (resize).
-    ///
-    /// This only covers maskable core events (those a client subscribes to via an
-    /// event mask); unmaskable events never appear in a mask, so they're audited
-    /// here by hand. Of those we implement MappingNotify, SelectionRequest and
-    /// SelectionNotify; GraphicsExpose / NoExpose are inapplicable (we do no
-    /// CopyArea/CopyPlane drawing). The one we deliberately omit is SelectionClear.
-    ///
-    /// We don't need SelectionClear because both X clients of this server —
-    /// vncagent and vncserverui — learn they've lost a selection from
-    /// XFixesSelectionNotify (both call XFixesSelectSelectionInput, and we send
-    /// that notify on every Wayland clipboard change), not from the ICCCM core
-    /// event. It would only matter for a strict-ICCCM X client that ignores
-    /// XFixes, of which there are none in this pipeline.
-    ///
-    /// It's also disproportionately fiddly to do correctly. When an X client takes
-    /// a selection we mirror it onto Wayland by creating our own data-control
-    /// source; the compositor then echoes that back as a selection change, so the
-    /// "Wayland selection changed" path can't tell our own echo from a foreign app
-    /// taking over and would clear the X owner the instant it copied. The only
-    /// unambiguous "lost to Wayland" signal is our source's `cancelled` event — but
-    /// that also fires when the same client re-copies (we replace our own source),
-    /// so distinguishing a real takeover needs source-generation tracking plus
-    /// shared cross-thread owner state, i.e. a real refactor of the working,
-    /// both-directions clipboard for no observable change. Not worth the risk.
-    fn warn_unsupported_events(&mut self, mask: xproto::EventMask) {
-        let supported =
-            u32::from(xproto::EventMask::PROPERTY_CHANGE | xproto::EventMask::STRUCTURE_NOTIFY);
-        let unsupported = u32::from(mask) & !supported & !self.warned_event_masks;
-        if unsupported != 0 {
-            self.warned_event_masks |= unsupported;
-            crate::warning!(
-                "client selected events we don't deliver: {:?}",
-                xproto::EventMask::from(unsupported)
-            );
-        }
-    }
-
     fn notify_screen_change(&self) {
         let (w, h, t, c) = {
             let s = self.server.screen.lock().unwrap();
@@ -1214,14 +1184,13 @@ impl Connection {
     fn start_fetch(&mut self, kind: Sel, selection: u32, owner: u32, time: u32) {
         let target = self.atoms.intern(b"UTF8_STRING", false);
         let property = self.atoms.intern(b"WL_UINPUT_PROXY_FETCH", false);
-        self.pending_fetch = Some(Fetch { kind, property });
-        self.incr_recv = None;
+        self.selection.begin_fetch(kind, property);
         let request = xproto::SelectionRequestEvent {
             response_type: xproto::SELECTION_REQUEST_EVENT,
             sequence: self.seq,
             time,
             owner,
-            requestor: FETCH_WINDOW,
+            requestor: SELECTION_FETCH_WINDOW,
             selection,
             target,
             property,
@@ -1238,46 +1207,35 @@ impl Connection {
         let Ok((notify, _)) = xproto::SelectionNotifyEvent::try_parse(&event[..]) else {
             return;
         };
-        if notify.requestor != FETCH_WINDOW {
+        if notify.requestor != SELECTION_FETCH_WINDOW {
             return;
         }
-        let Some(fetch) = self.pending_fetch.take() else {
+        let Some((kind, fetch_property)) = self.selection.take_fetch() else {
             return;
         };
         if notify.property == 0 {
             return;
         }
-        let Some(p) = self.properties.remove(&(FETCH_WINDOW, fetch.property)) else {
+        let Some(p) = self
+            .properties
+            .remove(SELECTION_FETCH_WINDOW, fetch_property)
+        else {
             return;
         };
         if self.atoms.name(p.type_) == Some(b"INCR") {
             // Large value: the owner will feed it in chunks. Per ICCCM, the
-            // requestor starts the transfer by deleting the INCR property (which
-            // the owner — watching this window — reacts to with the first chunk).
-            self.incr_recv = Some(IncrRecv { kind: fetch.kind, property: fetch.property, data: Vec::new() });
-            self.property_notify(FETCH_WINDOW, fetch.property, xproto::Property::DELETE);
+            // requestor starts the transfer by deleting the INCR property
+            // (which the owner, watching this window, reacts to with the first
+            // chunk).
+            self.selection.begin_incr(kind, fetch_property);
+            self.property_notify(
+                SELECTION_FETCH_WINDOW,
+                fetch_property,
+                xproto::Property::DELETE,
+            );
         } else {
-            self.server.clipboard.offer_to_wayland(fetch.kind, p.data);
+            self.server.clipboard.offer_to_wayland(kind, p.data);
         }
-    }
-
-    /// Attaches a client's SysV shared-memory segment (MIT-SHM) so we can write
-    /// captured pixels into it for ShmGetImage.
-    fn shm_attach(&mut self, shmseg: u32, shmid: u32) {
-        let ptr = unsafe { nix::libc::shmat(shmid as i32, std::ptr::null(), 0) };
-        if std::ptr::eq(ptr, nix::libc::MAP_FAILED) {
-            crate::warning!("shmat failed for shmid {shmid}");
-            return;
-        }
-        let size = unsafe {
-            let mut ds: nix::libc::shmid_ds = std::mem::zeroed();
-            if nix::libc::shmctl(shmid as i32, nix::libc::IPC_STAT, &mut ds) == 0 {
-                ds.shm_segsz as usize
-            } else {
-                0
-            }
-        };
-        self.shm_segments.insert(shmseg, ShmSeg { ptr: ptr.cast(), size });
     }
 
     /// Maps an X selection atom to the Wayland selection it bridges.
@@ -1328,9 +1286,14 @@ impl Connection {
             // 32-bit INTEGER. Polling clients (vncagent) convert TIMESTAMP and
             // re-read only when it changes.
             let ts = self.server.clipboard.timestamp(kind);
-            self.properties.insert(
-                (requestor, property),
-                Property { type_: INTEGER_ATOM, format: 32, data: ts.to_le_bytes().to_vec() },
+            self.properties.set(
+                requestor,
+                property,
+                Property {
+                    type_: XA_INTEGER,
+                    format: 32,
+                    data: ts.to_le_bytes().to_vec(),
+                },
             );
             return property;
         }
@@ -1340,7 +1303,15 @@ impl Connection {
             for a in targets {
                 data.extend_from_slice(&a.to_le_bytes());
             }
-            self.properties.insert((requestor, property), Property { type_: 4, format: 32, data });
+            self.properties.set(
+                requestor,
+                property,
+                Property {
+                    type_: 4,
+                    format: 32,
+                    data,
+                },
+            );
             return property;
         }
         let mimes = self.server.clipboard.mimes(kind);
@@ -1349,12 +1320,18 @@ impl Connection {
         };
         match self.server.clipboard.read(kind, &mime) {
             Some(data) if !data.is_empty() => {
-                self.properties.insert((requestor, property), Property { type_: target, format: 8, data });
+                self.properties.set(
+                    requestor,
+                    property,
+                    Property {
+                        type_: target,
+                        format: 8,
+                        data,
+                    },
+                );
                 property
             }
-            _other => {
-                0
-            }
+            _other => 0,
         }
     }
 
@@ -1381,11 +1358,7 @@ impl Connection {
     /// property append and blocks waiting for this event to read a server
     /// timestamp; without it, clipboard ownership/conversion never proceeds.
     fn property_notify(&self, window: u32, atom: u32, state: xproto::Property) {
-        let wants = self
-            .window_masks
-            .get(&window)
-            .is_some_and(|m| m.contains(xproto::EventMask::PROPERTY_CHANGE));
-        if !wants {
+        if !self.windows.wants_property_change(window) {
             return;
         }
         self.send_event(&xproto::PropertyNotifyEvent {
@@ -1393,7 +1366,7 @@ impl Connection {
             sequence: self.seq,
             window,
             atom,
-            time: crate::event::server_time_ms(),
+            time: crate::bridge::event::server_time_ms(),
             state,
         });
     }
@@ -1410,7 +1383,21 @@ impl Connection {
     }
 
     fn reply(&mut self, reply: &impl Serialize) -> io::Result<()> {
-        let mut buf = wire::build_reply(reply);
+        let mut buf = build_reply(reply);
+        self.client.send_reply(self.seq, &mut buf)
+    }
+
+    /// Sends an X error of `code` for the current request, identifying the
+    /// offending `major`/`minor` opcode. Used to fail requests we don't
+    /// implement; for a reply-expecting request the error takes the reply's
+    /// place so the client unblocks. The sequence is stamped by `send_reply`.
+    fn send_error(&self, code: u8, major: u8, minor: u16) -> io::Result<()> {
+        // 32-byte X error: [0]=0 (error), [1]=code, [2..4]=sequence (stamped by
+        // send_reply), [4..8]=bad value (0), [8..10]=minor opcode, [10]=major.
+        let mut buf = [0u8; 32];
+        buf[1] = code;
+        buf[8..10].copy_from_slice(&minor.to_le_bytes());
+        buf[10] = major;
         self.client.send_reply(self.seq, &mut buf)
     }
 }
@@ -1446,30 +1433,160 @@ fn pick_mime(target: Option<&[u8]>, mimes: &[String]) -> Option<String> {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.client.mark_dead();
-        for (_, seg) in self.shm_segments.drain() {
-            unsafe { nix::libc::shmdt(seg.ptr.cast()) };
-        }
     }
 }
 
-/// Bounding box of a rectangle list (`None` if empty).
-fn region_extents(rects: &[xproto::Rectangle]) -> Option<xproto::Rectangle> {
-    let mut it = rects.iter().filter(|r| r.width > 0 && r.height > 0);
-    let first = it.next()?;
-    let (mut x1, mut y1) = (i32::from(first.x), i32::from(first.y));
-    let (mut x2, mut y2) = (x1 + i32::from(first.width), y1 + i32::from(first.height));
-    for r in it {
-        x1 = x1.min(i32::from(r.x));
-        y1 = y1.min(i32::from(r.y));
-        x2 = x2.max(i32::from(r.x) + i32::from(r.width));
-        y2 = y2.max(i32::from(r.y) + i32::from(r.height));
+pub struct RawRequest {
+    pub major_opcode: u8,
+    pub minor_opcode: u8,
+    pub remaining_length: u32,
+    /// Everything after the 4/8-byte header for
+    /// [`x11rb_protocol::protocol::Request::parse`].
+    pub body: Vec<u8>,
+}
+
+/// Reads one request. Returns `Ok(None)` on a clean EOF at a request boundary.
+pub fn read_request(r: &mut impl Read) -> io::Result<Option<RawRequest>> {
+    let mut hdr = [0u8; 4];
+    if !read_exact_or_eof(r, &mut hdr)? {
+        return Ok(None);
     }
-    Some(xproto::Rectangle {
-        x: x1 as i16,
-        y: y1 as i16,
-        width: (x2 - x1) as u16,
-        height: (y2 - y1) as u16,
-    })
+    let major_opcode = hdr[0];
+    let minor_opcode = hdr[1];
+    let short_len = u16::from_le_bytes([hdr[2], hdr[3]]);
+    let remaining_length = if short_len == 0 {
+        // BIG-REQUESTS: the real length follows as a u32 in 4-byte units,
+        // including the now-2-unit header.
+        let mut ext = [0u8; 4];
+        r.read_exact(&mut ext)?;
+        u32::from_le_bytes(ext).saturating_sub(2)
+    } else {
+        u32::from(short_len) - 1
+    };
+    let mut body = vec![0u8; remaining_length as usize * 4];
+    r.read_exact(&mut body)?;
+    Ok(Some(RawRequest {
+        major_opcode,
+        minor_opcode,
+        remaining_length,
+        body,
+    }))
+}
+
+/// Like `read_exact`, but distinguishes a clean EOF (no bytes read) from a
+/// truncated read.
+fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> io::Result<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..])? {
+            0 if filled == 0 => return Ok(false),
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            n => filled += n,
+        }
+    }
+    Ok(true)
+}
+
+/// Serializes an x11rb reply, pads to the 32-byte wire minimum, and patches in
+/// the length field. The sequence number at `[2..4]` is left zero and stamped by
+/// the writer just before sending (see [`crate::bridge::event::Client::send_reply`]).
+///
+/// x11rb's reply `serialize` only emits the meaningful bytes (e.g. 12 for
+/// `QueryExtension`); the real wire format is always at least 32 bytes with
+/// `length` counting the extra 4-byte units beyond that. Patching `[4..8]` from
+/// the final length works for every reply because that field is always the reply
+/// length.
+pub fn build_reply(reply: &impl Serialize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32);
+    reply.serialize_into(&mut buf);
+    // Replies are at least 32 bytes, and their trailing variable data must be
+    // padded to a 4-byte boundary (x11rb's serialize doesn't always do this).
+    if buf.len() < 32 {
+        buf.resize(32, 0);
+    }
+    let pad = (4 - buf.len() % 4) % 4;
+    buf.resize(buf.len() + pad, 0);
+    let length = ((buf.len() - 32) / 4) as u32;
+    buf[4..8].copy_from_slice(&length.to_le_bytes());
+    buf
+}
+
+/// Serializes the setup reply (status byte + version + length + body) for a
+/// single TrueColor 24-bit screen of the given size. `resource_id_base` must be
+/// unique per connection so clients don't allocate colliding IDs.
+pub fn setup(geom: Geometry, resource_id_base: u32) -> Vec<u8> {
+    let visual = Visualtype {
+        visual_id: ROOT_VISUAL,
+        class: VisualClass::TRUE_COLOR,
+        bits_per_rgb_value: 8,
+        colormap_entries: 256,
+        red_mask: 0x00ff_0000,
+        green_mask: 0x0000_ff00,
+        blue_mask: 0x0000_00ff,
+    };
+    let screen = Screen {
+        root: ROOT_WINDOW,
+        default_colormap: ROOT_COLORMAP,
+        white_pixel: 0x00ff_ffff,
+        black_pixel: 0x0000_0000,
+        current_input_masks: EventMask::NO_EVENT,
+        width_in_pixels: geom.width,
+        height_in_pixels: geom.height,
+        width_in_millimeters: mm(geom.width) as u16,
+        height_in_millimeters: mm(geom.height) as u16,
+        min_installed_maps: 1,
+        max_installed_maps: 1,
+        root_visual: ROOT_VISUAL,
+        backing_stores: BackingStore::NOT_USEFUL,
+        save_unders: false,
+        root_depth: ROOT_DEPTH,
+        allowed_depths: vec![Depth {
+            depth: ROOT_DEPTH,
+            visuals: vec![visual],
+        }],
+    };
+    let setup = Setup {
+        status: 1, // success
+        protocol_major_version: 11,
+        protocol_minor_version: 0,
+        length: 0, // patched below
+        release_number: 0,
+        resource_id_base,
+        resource_id_mask: 0x001f_ffff,
+        motion_buffer_size: 256,
+        maximum_request_length: 65535,
+        image_byte_order: ImageOrder::LSB_FIRST,
+        bitmap_format_bit_order: ImageOrder::LSB_FIRST,
+        bitmap_format_scanline_unit: 32,
+        bitmap_format_scanline_pad: 32,
+        min_keycode: 8,
+        max_keycode: 255,
+        vendor: b"xwlrvnc".to_vec(),
+        pixmap_formats: vec![
+            Format {
+                depth: 1,
+                bits_per_pixel: 1,
+                scanline_pad: 32,
+            },
+            Format {
+                depth: 24,
+                bits_per_pixel: 32,
+                scanline_pad: 32,
+            },
+            Format {
+                depth: 32,
+                bits_per_pixel: 32,
+                scanline_pad: 32,
+            },
+        ],
+        roots: vec![screen],
+    };
+    let mut buf = Vec::new();
+    setup.serialize_into(&mut buf);
+    // `length` counts the 4-byte units after the 8-byte header.
+    let length = ((buf.len() - 8) / 4) as u16;
+    buf[6..8].copy_from_slice(&length.to_le_bytes());
+    buf
 }
 
 /// A failed `GetOutputInfo` reply for an unknown output id.
@@ -1568,63 +1685,3 @@ static MODIFIER_MAP: [u8; 16] = [
 fn pad4(n: usize) -> usize {
     (n + 3) & !3
 }
-
-/// Atom name<->id table, seeded with the predefined atoms (ids 1..=68).
-struct AtomTable {
-    by_name: HashMap<Vec<u8>, u32>,
-    by_id: HashMap<u32, Vec<u8>>,
-    next: u32,
-}
-
-impl AtomTable {
-    fn new() -> Self {
-        let mut t = Self {
-            by_name: HashMap::new(),
-            by_id: HashMap::new(),
-            next: PREDEFINED_ATOMS.len() as u32 + 1,
-        };
-        for (i, name) in PREDEFINED_ATOMS.iter().enumerate() {
-            let id = i as u32 + 1;
-            t.by_name.insert(name.as_bytes().to_vec(), id);
-            t.by_id.insert(id, name.as_bytes().to_vec());
-        }
-        t
-    }
-
-    fn intern(&mut self, name: &[u8], only_if_exists: bool) -> u32 {
-        if let Some(&id) = self.by_name.get(name) {
-            return id;
-        }
-        if only_if_exists {
-            return 0;
-        }
-        let id = self.next;
-        self.next += 1;
-        self.by_name.insert(name.to_vec(), id);
-        self.by_id.insert(id, name.to_vec());
-        id
-    }
-
-    fn name(&self, id: u32) -> Option<&[u8]> {
-        self.by_id.get(&id).map(Vec::as_slice)
-    }
-}
-
-/// The predefined atoms from `Xatom.h`, in id order starting at 1.
-#[rustfmt::skip]
-static PREDEFINED_ATOMS: &[&str] = &[
-    "PRIMARY", "SECONDARY", "ARC", "ATOM", "BITMAP", "CARDINAL", "COLORMAP",
-    "CURSOR", "CUT_BUFFER0", "CUT_BUFFER1", "CUT_BUFFER2", "CUT_BUFFER3",
-    "CUT_BUFFER4", "CUT_BUFFER5", "CUT_BUFFER6", "CUT_BUFFER7", "DRAWABLE",
-    "FONT", "INTEGER", "PIXMAP", "POINT", "RECTANGLE", "RESOURCE_MANAGER",
-    "RGB_COLOR_MAP", "RGB_BEST_MAP", "RGB_BLUE_MAP", "RGB_DEFAULT_MAP",
-    "RGB_GRAY_MAP", "RGB_GREEN_MAP", "RGB_RED_MAP", "STRING", "VISUALID",
-    "WINDOW", "WM_COMMAND", "WM_HINTS", "WM_CLIENT_MACHINE", "WM_ICON_NAME",
-    "WM_ICON_SIZE", "WM_NAME", "WM_NORMAL_HINTS", "WM_SIZE_HINTS",
-    "WM_ZOOM_HINTS", "MIN_SPACE", "NORM_SPACE", "MAX_SPACE", "END_SPACE",
-    "SUPERSCRIPT_X", "SUPERSCRIPT_Y", "SUBSCRIPT_X", "SUBSCRIPT_Y",
-    "UNDERLINE_POSITION", "UNDERLINE_THICKNESS", "STRIKEOUT_ASCENT",
-    "STRIKEOUT_DESCENT", "ITALIC_ANGLE", "X_HEIGHT", "QUAD_WIDTH", "WEIGHT",
-    "POINT_SIZE", "RESOLUTION", "COPYRIGHT", "NOTICE", "FONT_NAME",
-    "FAMILY_NAME", "FULL_NAME", "CAP_HEIGHT", "WM_CLASS", "WM_TRANSIENT_FOR",
-];
