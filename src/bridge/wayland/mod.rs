@@ -90,7 +90,8 @@ pub fn spawn(server: Arc<Server>) {
     // settle the registry globals, and the events they trigger, before the
     // caller spawns the wrapped binary
     for _ in 0..3 {
-        if queue.roundtrip(&mut state).is_err() {
+        if let Err(e) = queue.roundtrip(&mut state) {
+            crate::warning!("wayland setup failed: {e}; using default geometry");
             return;
         }
     }
@@ -100,11 +101,14 @@ pub fn spawn(server: Arc<Server>) {
         // each pass issues whatever is due, then waits on the socket only until
         // the next capture is scheduled.
         loop {
-            if queue.dispatch_pending(&mut state).is_err() {
-                return;
+            if let Err(e) = queue.dispatch_pending(&mut state) {
+                crate::warning!("wayland dispatch failed, continuing: {e}");
             }
             let timeout = state.tick_captures(&qh);
-            if conn.flush().is_err() {
+            if let Err(e) = conn.flush() {
+                crate::warning!(
+                    "wayland connection lost on flush: {e}; screen capture has stopped"
+                );
                 return;
             }
             let Some(guard) = conn.prepare_read() else {
@@ -123,7 +127,9 @@ pub fn spawn(server: Arc<Server>) {
                     Err(wayland_client::backend::WaylandError::Io(e))
                         if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
-                        crate::warning!("wayland read stopped: {e}");
+                        crate::warning!(
+                            "wayland connection lost on read: {e}; screen capture has stopped"
+                        );
                         return;
                     }
                 }
