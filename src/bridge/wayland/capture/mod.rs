@@ -139,7 +139,11 @@ impl State {
         if !has_wlr && !has_ext {
             return;
         }
-        if matches!(self.capture, Capture::None) {
+        let upgrade = has_ext && matches!(self.capture, Capture::Screencopy(_));
+        if upgrade {
+            crate::vlog!("switching to ext-image-copy-capture-v1");
+        }
+        if matches!(self.capture, Capture::None) || upgrade {
             let Some(shm) = self.shm.clone() else { return };
             self.capture = if has_ext {
                 Capture::ImageCopy(ImageCopyCapture::new(
