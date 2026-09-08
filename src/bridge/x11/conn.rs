@@ -226,25 +226,34 @@ impl Connection {
                 })?;
             }
             Request::SetSelectionOwner(r) => {
-                if r.owner == 0 {
-                    self.selection.clear_owner(r.selection);
-                } else {
-                    self.selection.set_owner(r.selection, r.owner);
-                    // A real X client took ownership: pull its data into Wayland.
-                    if r.owner != crate::bridge::clipboard::OWNER_WINDOW
-                        && let Some(kind) = self.selection_kind(r.selection)
-                    {
-                        self.start_fetch(kind, r.selection, r.owner, r.time);
-                    }
+                // bridged selections are server-global (Wayland can revoke
+                // them), the rest are per-connection
+                let kind = self.selection_kind(r.selection);
+                match (kind, r.owner) {
+                    (Some(k), 0) => self.server.clipboard.clear_x_owner(k),
+                    (Some(k), owner) => self.server.clipboard.set_x_owner(k, owner),
+                    (None, 0) => self.selection.clear_owner(r.selection),
+                    (None, owner) => self.selection.set_owner(r.selection, owner),
+                }
+                // A real X client took ownership: pull its data into Wayland.
+                if r.owner != 0
+                    && r.owner != crate::bridge::clipboard::OWNER_WINDOW
+                    && let Some(kind) = kind
+                {
+                    self.start_fetch(kind, r.selection, r.owner, r.time);
                 }
             }
             Request::GetSelectionOwner(r) => {
                 // An X client owner wins; otherwise we own it if Wayland has it.
-                let owner = self.selection.owner(r.selection).or_else(|| {
-                    self.selection_kind(r.selection)
-                        .filter(|k| self.server.clipboard.has(*k))
-                        .map(|_| crate::bridge::clipboard::OWNER_WINDOW)
-                });
+                let owner = match self.selection_kind(r.selection) {
+                    Some(k) => self.server.clipboard.x_owner(k).or_else(|| {
+                        self.server
+                            .clipboard
+                            .has(k)
+                            .then_some(crate::bridge::clipboard::OWNER_WINDOW)
+                    }),
+                    None => self.selection.owner(r.selection),
+                };
                 self.reply(&xproto::GetSelectionOwnerReply {
                     sequence: 0,
                     length: 0,
@@ -1314,11 +1323,19 @@ impl Connection {
             );
             return property;
         }
-        let mimes = self.server.clipboard.mimes(kind);
+        let mimes = self.selection_mimes(kind);
         let Some(mime) = pick_mime(target_name.as_deref(), &mimes) else {
             return 0;
         };
-        match self.server.clipboard.read(kind, &mime) {
+        // an X owner's bytes are already here, and reading them back out of the
+        // compositor would round-trip into our own source: blocking this thread
+        // on the Wayland one, and serving the previous selection until the
+        // compositor announces the new one
+        let data = match self.server.clipboard.x_owner(kind) {
+            Some(_) => Some(self.server.clipboard.x_data(kind)),
+            None => self.server.clipboard.read(kind, &mime),
+        };
+        match data {
             Some(data) if !data.is_empty() => {
                 self.properties.set(
                     requestor,
@@ -1335,9 +1352,22 @@ impl Connection {
         }
     }
 
+    /// The mime types `kind` can be converted to. While an X client owns it,
+    /// the ones we advertise on its behalf: the stored offer is still the
+    /// previous one until the compositor announces the source we published.
+    fn selection_mimes(&self, kind: Sel) -> Vec<String> {
+        if self.server.clipboard.x_owner(kind).is_some() {
+            return crate::bridge::clipboard::TEXT_MIMES
+                .iter()
+                .map(|m| (*m).to_string())
+                .collect();
+        }
+        self.server.clipboard.mimes(kind)
+    }
+
     /// The list of target atoms we can convert the given selection to.
     fn supported_targets(&mut self, kind: Sel) -> Vec<u32> {
-        let mimes = self.server.clipboard.mimes(kind);
+        let mimes = self.selection_mimes(kind);
         let mut out = vec![
             self.atoms.intern(b"TARGETS", false),
             self.atoms.intern(b"TIMESTAMP", false),

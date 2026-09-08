@@ -6,7 +6,7 @@
 //! X to Wayland: X threads stash the data and call the source factory the
 //! Wayland thread installed, which mints a data-control source for it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Mutex;
@@ -89,6 +89,12 @@ struct Inner {
     primary: Offered,
     serial: u32, // bumped on every change, used as the X selection timestamp
     x_data: HashMap<Sel, Vec<u8>>, // data X owns and serves to Wayland
+    /// X window owning each bridged selection, if a client does. Server-global,
+    /// since vncagent and vncserverui are separate connections which must agree.
+    x_owner: HashMap<Sel, u32>,
+    /// Published to Wayland, still awaiting the compositor's selection event
+    /// for it. See [`take_self_published`](Clipboard::take_self_published).
+    self_published: HashSet<Sel>,
 }
 
 impl Inner {
@@ -171,10 +177,39 @@ impl Clipboard {
 
     /// Stashes the data X will serve for `sel` and offers it on Wayland.
     pub fn offer_to_wayland(&self, sel: Sel, data: Vec<u8>) {
-        self.inner.lock().unwrap().x_data.insert(sel, data);
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.x_data.insert(sel, data);
+            g.self_published.insert(sel);
+        }
         if let Some(factory) = self.factory.lock().unwrap().as_ref() {
             factory(sel);
         }
+    }
+
+    /// Records the X client owning `sel`.
+    pub fn set_x_owner(&self, sel: Sel, window: u32) {
+        self.inner.lock().unwrap().x_owner.insert(sel, window);
+    }
+
+    /// Drops the X owner of `sel`, when it releases the selection or a Wayland
+    /// app takes it.
+    pub fn clear_x_owner(&self, sel: Sel) {
+        self.inner.lock().unwrap().x_owner.remove(&sel);
+    }
+
+    /// The X client owning `sel`, if one does rather than Wayland.
+    pub fn x_owner(&self, sel: Sel) -> Option<u32> {
+        self.inner.lock().unwrap().x_owner.get(&sel).copied()
+    }
+
+    /// Whether we published `sel` ourselves and have not yet accounted for it,
+    /// clearing the record. The compositor announces the source we published
+    /// exactly as it would any other app's, so without this the X owner we just
+    /// recorded looks superseded. A foreign copy arriving first clears the
+    /// record instead, which resolves on the next change.
+    pub fn take_self_published(&self, sel: Sel) -> bool {
+        self.inner.lock().unwrap().self_published.remove(&sel)
     }
 
     /// The data X is serving for `sel`, for a data-control `send`.

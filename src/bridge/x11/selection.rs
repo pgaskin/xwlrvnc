@@ -5,7 +5,10 @@ use crate::bridge::{clipboard::Sel, x11::SELECTION_FETCH_WINDOW};
 /// Per-connection clipboard/selection state machine.
 #[derive(Default)]
 pub struct Selection {
-    /// Selection atom to owner window, for real X client owners.
+    /// Owner window per selection atom, for the selections we don't bridge to
+    /// Wayland; the bridged ones live in
+    /// [`Clipboard`](crate::bridge::clipboard::Clipboard). These can't be shared
+    /// since atoms are interned per connection.
     owners: HashMap<u32, u32>,
     pending_fetch: Option<Fetch>,
     incr_recv: Option<IncrRecv>,

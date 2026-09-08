@@ -113,6 +113,11 @@ impl State {
             .as_ref()
             .and_then(|o| self.offer_mimes.remove(&o.id()))
             .unwrap_or_default();
+        // a foreign app taking the selection revokes any X owner, but the
+        // compositor announces the source we published through here too
+        if !self.server.clipboard.take_self_published(sel) {
+            self.server.clipboard.clear_x_owner(sel);
+        }
         let owner = if offer.is_some() {
             clipboard::OWNER_WINDOW
         } else {
