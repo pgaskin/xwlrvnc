@@ -2,7 +2,7 @@
 //!
 //! X servers take single-dash long options (`-display`, `-nolisten`) and stop
 //! at the first non-option argument. clap can't express that, so
-//! [`define_config!`] generates a config struct, its parser, and `-help` text
+//! `define_config!` generates a config struct, its parser, and `-help` text
 //! (formatted like `Xwayland -help`) straight from the field definitions: the
 //! option name is the field name with `_` replaced with `-`, matched
 //! case-insensitively, and value/flag handling follows the field's kind.

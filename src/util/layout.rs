@@ -2,7 +2,7 @@
 //! compositor's logical space.
 //!
 //! The X screen tiles each output's native-resolution capture buffer at a
-//! physical position (see [`crate::bridge::x11::screen`]); the compositor's virtual
+//! physical position (see [`crate::bridge::x11::randr`]); the compositor's virtual
 //! pointer, however, wants absolute motion in *logical* coordinates so it lands
 //! correctly under (possibly mixed/fractional) output scaling. [`Layout`] pairs
 //! each output's physical and logical rectangles and maps a physical point back

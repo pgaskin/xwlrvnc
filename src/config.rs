@@ -1,6 +1,6 @@
 //! The runtime configuration: backend choices and the wrapped command, parsed
 //! X11-style from the command line. The parser, help text and `ArgEnum` trait
-//! live in [`crate::util::args`]; this module just defines the option enums and
+//! live in `crate::util::args`; this module just defines the option enums and
 //! the [`Config`] fields they're generated from.
 
 use crate::util::{ArgEnum, Geometry};

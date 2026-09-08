@@ -3,7 +3,7 @@
 //! fallback.
 //!
 //! Runs its own event-queue thread. Output changes update the shared
-//! [`Screen`](crate::bridge::x11::screen::Screen); clipboard offers update the shared
+//! [`Screen`](crate::bridge::x11::randr::Screen); clipboard offers update the shared
 //! [`Clipboard`](crate::bridge::clipboard::Clipboard) and notify X clients.
 
 use std::collections::HashMap;

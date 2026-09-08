@@ -17,7 +17,7 @@ mod xfixes;
 pub const CLIENT_RESOURCE_ID_BASE: u32 = 0x0040_0000;
 
 /// Root window resource ID (arbitrary, must be outside client
-/// `resource_id_base`/`mask` in [`setup`]).
+/// `resource_id_base`/`mask` in [`conn::setup`]).
 pub const ROOT_WINDOW: u32 = 0x0000_016b;
 
 /// Default colormap resource ID (arbitrary, also outside client range).

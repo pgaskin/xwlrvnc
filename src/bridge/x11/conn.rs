@@ -1075,12 +1075,12 @@ impl Connection {
             }
 
             Request::ChangeKeyboardControl(r) => {
-                if let Some(m) = r.value_list.auto_repeat_mode {
-                    if m == AutoRepeatMode::OFF {
-                        crate::fixme!(
-                            "keyboard auto-repeat cannot be disabled with current wayland interfaces"
-                        )
-                    }
+                if let Some(m) = r.value_list.auto_repeat_mode
+                    && m == AutoRepeatMode::OFF
+                {
+                    crate::fixme!(
+                        "keyboard auto-repeat cannot be disabled with current wayland interfaces"
+                    )
                 }
                 // we don't care about bells or lights
             }
@@ -1183,7 +1183,7 @@ impl Connection {
     /// can offer it on Wayland (X -> Wayland direction).
     fn start_fetch(&mut self, kind: Sel, selection: u32, owner: u32, time: u32) {
         let target = self.atoms.intern(b"UTF8_STRING", false);
-        let property = self.atoms.intern(b"WL_UINPUT_PROXY_FETCH", false);
+        let property = self.atoms.intern(b"XWLRVNC_FETCH", false);
         self.selection.begin_fetch(kind, property);
         let request = xproto::SelectionRequestEvent {
             response_type: xproto::SELECTION_REQUEST_EVENT,
