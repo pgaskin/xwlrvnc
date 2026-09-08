@@ -30,4 +30,4 @@ xkbcommon-rs = { version = "0.1.2", features = ["client", "server"] }
 debug = true
 
 [workspace]
-exclude = ["dynres-hook"] # can't do the profile options otherwise
+exclude = ["dynres"] # can't do the profile options otherwise
