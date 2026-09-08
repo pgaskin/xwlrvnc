@@ -116,14 +116,14 @@ The following wayland protocols are used. At least one in each category is requi
 - Dynamic resolution
   - [`zwlr_output_manager_v1`](https://wayland.app/protocols/wlr-output-management-unstable-v1)
 
-If your compositor is has a broken/missing virtual keyboard/pointer implementation (e.g., Smithay-based ones like niri), you'll need to wrap xrvncwrap with [wl-uinput-proxy](https://github.com/pgaskin/wl-uinput-proxy) to work around it using uinput.
+If your compositor is has a broken/missing virtual keyboard/pointer implementation (e.g., Smithay-based ones like niri), you'll need to wrap xwlrvnc with [wl-uinput-proxy](https://github.com/pgaskin/wl-uinput-proxy) to work around it using uinput.
 
 I'll probably add support for other capture/input protocols later, and maybe also xdg-desktop-portal.
 
 ### TODO
 
 - In progress
-  - Refactor everything and clean up Claude's mess (almost done, just go over everything again)
+  - Refactor everything and clean up Claude's mess (almost done, just need to go over everything again)
 
 - Future
   - See if we can make input work on headless compositors with no existing seats.
