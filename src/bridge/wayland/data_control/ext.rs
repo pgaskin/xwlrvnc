@@ -1,8 +1,6 @@
 //! `ext-data-control-v1` backend: the [`DataControlManager`] impl plus the
 //! device, offer and source `Dispatch` impls.
 
-use std::io::Write;
-
 use wayland_client::protocol::wl_seat;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1::{
     self as ext_device_v1, ExtDataControlDeviceV1,
@@ -99,7 +97,7 @@ impl Dispatch<ExtDataControlSourceV1, Sel> for State {
         match event {
             ext_source_v1::Event::Send { mime_type: _, fd } => {
                 let data = state.server.clipboard.x_data(*sel);
-                let _ = std::fs::File::from(fd).write_all(&data);
+                state.queue_send(fd, data);
             }
             ext_source_v1::Event::Cancelled => source.destroy(),
             _ => {}

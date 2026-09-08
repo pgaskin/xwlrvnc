@@ -39,7 +39,7 @@ mod output;
 mod registry;
 mod shm;
 use capture::Capture;
-use data_control::DataDevice;
+use data_control::{DataDevice, PendingSend};
 use input::{KeyboardBackend, PointerBackend};
 use output::OutputAcc;
 use shm::{ShmBuffer, blit_channels, channel_map, create_shm_buffer, pixel_layout};
@@ -74,6 +74,7 @@ pub fn spawn(server: Arc<Server>) {
         wlr_manager: None,
         device: None,
         offer_mimes: HashMap::new(),
+        pending_sends: Vec::new(),
         shm: None,
         screencopy: None,
         ext_source_mgr: None,
@@ -100,10 +101,14 @@ pub fn spawn(server: Arc<Server>) {
         // A manual loop rather than blocking_dispatch, so capture can self-pace:
         // each pass issues whatever is due, then waits on the socket only until
         // the next capture is scheduled.
+        let mut pfds: Vec<nix::libc::pollfd> = Vec::new();
         loop {
             if let Err(e) = queue.dispatch_pending(&mut state) {
                 crate::warning!("wayland dispatch failed, continuing: {e}");
             }
+            // before the tick, so a stalled clipboard send makes progress on
+            // every pass however we got here
+            state.flush_pending_sends();
             let timeout = state.tick_captures(&qh);
             if let Err(e) = conn.flush() {
                 crate::warning!(
@@ -114,14 +119,23 @@ pub fn spawn(server: Arc<Server>) {
             let Some(guard) = conn.prepare_read() else {
                 continue; // events already queued, go dispatch them
             };
-            let mut pfd = [nix::libc::pollfd {
+            pfds.clear();
+            pfds.push(nix::libc::pollfd {
                 fd: guard.connection_fd().as_raw_fd(),
                 events: nix::libc::POLLIN,
                 revents: 0,
-            }];
+            });
+            // wake as soon as a stalled send's receiver drains its pipe, rather
+            // than waiting out the capture interval
+            pfds.extend(state.pending_send_fds().map(|fd| nix::libc::pollfd {
+                fd,
+                events: nix::libc::POLLOUT,
+                revents: 0,
+            }));
             let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-            let n = unsafe { nix::libc::poll(pfd.as_mut_ptr(), 1, ms) };
-            if n > 0 && pfd[0].revents & nix::libc::POLLIN != 0 {
+            let n =
+                unsafe { nix::libc::poll(pfds.as_mut_ptr(), pfds.len() as nix::libc::nfds_t, ms) };
+            if n > 0 && pfds[0].revents & nix::libc::POLLIN != 0 {
                 match guard.read() {
                     Ok(_) => {}
                     Err(wayland_client::backend::WaylandError::Io(e))
@@ -157,6 +171,9 @@ struct State {
     wlr_manager: Option<ZwlrDataControlManagerV1>, // clipboard, fallback
     device: Option<DataDevice>,
     offer_mimes: HashMap<ObjectId, Vec<String>>, // keyed by the offer's object id
+    /// X-owned selections still being written to a receiving app's pipe. See
+    /// [`State::queue_send`].
+    pending_sends: Vec<PendingSend>,
     shm: Option<wl_shm::WlShm>,
     screencopy: Option<ZwlrScreencopyManagerV1>, // capture, fallback
     ext_source_mgr: Option<ExtOutputImageCaptureSourceManagerV1>, // capture, preferred

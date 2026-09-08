@@ -6,6 +6,12 @@
 //! and [`wlr`], and the X-to-Wayland source factory is written once over that
 //! trait in [`install_source_factory`]. The `Dispatch` impls have to stay
 //! concrete, but they all defer to [`State::update_selection`].
+//!
+//! Serving an X-owned selection to Wayland goes through [`PendingSend`], which
+//! keeps the write off this thread's critical path; see [`State::queue_send`].
+
+use std::os::fd::RawFd;
+use std::time::{Duration, Instant};
 
 use wayland_client::protocol::wl_seat;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1::ExtDataControlDeviceV1;
@@ -19,6 +25,15 @@ mod wlr;
 /// Opcode of the `data_offer` event, which creates the child offer object. The
 /// same value on both device interfaces.
 const DATA_OFFER_OPCODE: u16 = 0;
+
+/// How many `send` transfers may be in flight before the oldest is dropped. A
+/// receiver that asks for the selection and never reads it would otherwise pin
+/// a pipe forever, and a paste storm would pin one each.
+const MAX_PENDING_SENDS: usize = 8;
+
+/// How long a `send` may make no progress before we give up on it and close the
+/// pipe (the receiver sees a truncated value, which beats holding the fd).
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The live device, whichever protocol won. Held rather than read: dropping the
 /// proxy would destroy the device.
@@ -63,7 +78,112 @@ fn install_source_factory<M: DataControlManager>(
     }));
 }
 
+/// One in-flight data-control `send`: the receiving app's pipe, the value we
+/// are feeding into it, and when we last managed to write something.
+pub(super) struct PendingSend {
+    fd: OwnedFd,
+    data: Vec<u8>,
+    offset: usize,
+    progress_at: Instant,
+}
+
+impl PendingSend {
+    /// Writes until the pipe is full, returning whether the transfer is over —
+    /// either finished, or the receiver went away.
+    fn pump(&mut self) -> bool {
+        while self.offset < self.data.len() {
+            let rest = &self.data[self.offset..];
+            // SAFETY: writing `rest.len()` bytes from `rest` to an fd we own
+            let n =
+                unsafe { nix::libc::write(self.fd.as_raw_fd(), rest.as_ptr().cast(), rest.len()) };
+            if n > 0 {
+                self.offset += n as usize;
+                self.progress_at = Instant::now();
+                continue;
+            }
+            if n == 0 {
+                return true; // can't happen on a pipe, but don't spin on it
+            }
+            return match std::io::Error::last_os_error().kind() {
+                // the pipe is full or we were interrupted, so come back to it
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => false,
+                // EPIPE (the receiver closed its end) or worse; nothing to do
+                _ => true,
+            };
+        }
+        true
+    }
+}
+
 impl State {
+    /// Starts feeding `data` to the pipe a data-control `send` handed us.
+    ///
+    /// The obvious `write_all` here would block this thread — and with it the
+    /// whole event loop, so screen capture and input injection too — for as long
+    /// as the receiving app takes to drain a value larger than the 64KiB pipe
+    /// buffer, or forever if it never reads at all. So the pipe goes
+    /// non-blocking and whatever doesn't fit is finished by the event loop in
+    /// [`flush_pending_sends`](Self::flush_pending_sends).
+    pub(super) fn queue_send(&mut self, fd: OwnedFd, data: Vec<u8>) {
+        // SAFETY: the fd is ours, so O_NONBLOCK on it affects nobody else
+        unsafe {
+            let flags = nix::libc::fcntl(fd.as_raw_fd(), nix::libc::F_GETFL);
+            if flags >= 0 {
+                nix::libc::fcntl(
+                    fd.as_raw_fd(),
+                    nix::libc::F_SETFL,
+                    flags | nix::libc::O_NONBLOCK,
+                );
+            }
+        }
+        let mut send = PendingSend {
+            fd,
+            data,
+            offset: 0,
+            progress_at: Instant::now(),
+        };
+        // the common case is a selection small enough to fit in the pipe buffer,
+        // which finishes here and never reaches the queue at all
+        if send.pump() {
+            return;
+        }
+        crate::vlog!(
+            "clipboard send did not fit the pipe; {} of {} bytes queued",
+            send.data.len() - send.offset,
+            send.data.len(),
+        );
+        if self.pending_sends.len() >= MAX_PENDING_SENDS {
+            crate::warning!("too many clipboard sends in flight; dropping the oldest");
+            self.pending_sends.remove(0);
+        }
+        self.pending_sends.push(send);
+    }
+
+    /// The pipes still being written, for the event loop's poll set, so a
+    /// stalled send wakes us as soon as its receiver makes room.
+    pub(super) fn pending_send_fds(&self) -> impl Iterator<Item = RawFd> + '_ {
+        self.pending_sends.iter().map(|s| s.fd.as_raw_fd())
+    }
+
+    /// Writes whatever each in-flight send's pipe will take right now, dropping
+    /// the ones that finish, fail, or stop making progress.
+    pub(super) fn flush_pending_sends(&mut self) {
+        let now = Instant::now();
+        self.pending_sends.retain_mut(|s| {
+            if s.pump() {
+                return false;
+            }
+            if now.duration_since(s.progress_at) >= SEND_TIMEOUT {
+                crate::warning!(
+                    "clipboard send stalled with {} bytes left; giving up",
+                    s.data.len() - s.offset,
+                );
+                return false;
+            }
+            true
+        });
+    }
+
     pub(super) fn try_init_device(&mut self, conn: &Connection, qh: &QueueHandle<Self>) {
         // an ext device is already the best we can do
         if matches!(self.device, Some(DataDevice::Ext(_))) {

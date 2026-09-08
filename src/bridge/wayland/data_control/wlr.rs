@@ -1,9 +1,6 @@
 //! `zwlr-data-control-v1` backend: the [`DataControlManager`] impl plus the
 //! device, offer and source `Dispatch` impls.
 
-use std::fs::File;
-use std::io::Write;
-
 use wayland_client::protocol::wl_seat;
 use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_device_v1::{
     self, ZwlrDataControlDeviceV1,
@@ -100,7 +97,7 @@ impl Dispatch<ZwlrDataControlSourceV1, Sel> for State {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type: _, fd } => {
                 let data = state.server.clipboard.x_data(*sel);
-                let _ = File::from(fd).write_all(&data);
+                state.queue_send(fd, data);
             }
             zwlr_data_control_source_v1::Event::Cancelled => source.destroy(),
             _ => {}
