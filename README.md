@@ -60,7 +60,7 @@ The core VNC features, plus some RealVNC extensions work correctly and have been
     - Additional encryption methods.
     - Additional encodings.
     - File transfer.
-  - TODO: Dynamic resolution (if enabled, needs a [hook](./dynres/))
+  - Dynamic resolution (if enabled, needs a [hook](./dynres/)).
 - Performance:
   - Adaptive capture rate for reduced CPU usage.
   - No capture while idle.
@@ -114,7 +114,7 @@ The following wayland protocols are used. At least one in each category is requi
 - Client-side cursor (optional)
   - [`ext_image_copy_capture_v1`](https://wayland.app/protocols/ext-image-copy-capture-v1)
 - Dynamic resolution
-  - TODO: [`zwlr_output_manager_v1`](https://wayland.app/protocols/wlr-output-management-unstable-v1)
+  - [`zwlr_output_manager_v1`](https://wayland.app/protocols/wlr-output-management-unstable-v1)
 
 If your compositor is has a broken/missing virtual keyboard/pointer implementation (e.g., Smithay-based ones like niri), you'll need to wrap xrvncwrap with [wl-uinput-proxy](https://github.com/pgaskin/wl-uinput-proxy) to work around it using uinput.
 
@@ -123,11 +123,7 @@ I'll probably add support for other capture/input protocols later, and maybe als
 ### TODO
 
 - In progress
-  - Refactor everything and clean up Claude's mess.
-  - Make startup more deterministic.
-  - Add options for pointer/keyboard input protocol.
-  - Implement `RandrSetScreenSize` and `RandrSetCrtcConfig` with `zwlr_output_manager_v1` for dynamic resolution support.
-  - Better logging.
+  - Refactor everything and clean up Claude's mess (half done, just need to do the stuff under `src/bridge`)
 
 - Future
   - See if we can make input work on headless compositors with no existing seats.
