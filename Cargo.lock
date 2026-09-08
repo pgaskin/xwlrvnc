@@ -899,7 +899,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xwlrvnc"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "nix 0.30.1",
  "wayland-client",
