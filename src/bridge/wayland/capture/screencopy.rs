@@ -1,8 +1,8 @@
 //! `zwlr-screencopy-v1` capture backend.
 //!
-//! Each output is captured with a plain `copy` into a wl_shm buffer; we diff the
-//! result against the framebuffer to compute damage and self-pace the next
-//! request (the compositor offers no damage feedback on plain `copy`).
+//! Each output is captured with a plain `copy` into a wl_shm buffer. Plain
+//! `copy` reports no damage, so we diff the result against the framebuffer to
+//! work out what changed and to pace the next request.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -15,25 +15,24 @@ use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::Z
 
 use super::*;
 
-/// Per-output capture state for the wlr path.
+/// One output's capture state.
 struct Ctx {
     output: wl_output::WlOutput,
     x: i32,
     y: i32,
     buffer: Option<ShmBuffer>,
-    /// A capture has been requested and we're awaiting its `ready`/`failed`.
+    /// A capture is out, awaiting its `ready`/`failed`.
     in_flight: bool,
-    /// Earliest time the next capture for this output should be requested.
+    /// Earliest the next capture may be requested.
     next_at: Instant,
-    /// When the in-flight capture was requested (latency profiling).
+    /// When the in-flight capture went out, for latency profiling.
     req_at: Option<Instant>,
-    /// Pending frame format from the `buffer` event, applied on `buffer_done`.
+    /// Format from the `buffer` event, applied on `buffer_done`.
     pending: Option<(wl_shm::Format, u32, u32, u32)>,
     y_invert: bool,
-    /// Current adaptive capture interval (resets to fast on change, backs off
-    /// toward slow on unchanged frames).
+    /// Adaptive interval: fast on change, backing off on unchanged frames.
     interval: Duration,
-    /// `Framebuffer::last_read_ms` seen at the previous blit (no-damage pacing).
+    /// `Framebuffer::last_read_ms` at the previous blit, for no-damage pacing.
     last_read_seen: u64,
 }
 
@@ -62,15 +61,15 @@ impl ScreencopyCapture {
         let Some(ctx) = self.ctxs.get_mut(&wl_name) else {
             return;
         };
-        // overlay_cursor = 1: render the cursor into the captured image so it's
-        // visible to the remote (we report a transparent XFixes cursor so the
-        // VNC agent doesn't draw a second one on top).
+        // overlay_cursor = 1 renders the cursor into the image so the remote can
+        // see it; we then report a transparent XFixes cursor so the agent doesn't
+        // draw a second one on top
         self.mgr.capture_output(1, &ctx.output, qh, wl_name);
         ctx.in_flight = true;
         ctx.req_at = Some(Instant::now());
     }
 
-    /// Creates the shm buffer (if needed) and asks the compositor to copy.
+    /// Creates the shm buffer if needed, then asks the compositor to copy.
     fn copy_frame(&mut self, wl_name: u32, frame: &ZwlrScreencopyFrameV1, qh: &QueueHandle<State>) {
         let Some(ctx) = self.ctxs.get_mut(&wl_name) else {
             return;
@@ -85,23 +84,23 @@ impl ScreencopyCapture {
             ctx.buffer = create_shm_buffer(&self.shm, qh, format, w, h, stride);
         }
         if let Some(buf) = &ctx.buffer {
-            // Always plain `copy` — we compute damage ourselves by diffing in
-            // blit_diff (see its comment for why we avoid copy_with_damage).
+            // always plain `copy`; blit_diff computes damage itself, and says why
+            // copy_with_damage is not worth having
             frame.copy(&buf.buffer);
         }
     }
 
-    /// Blits a completed capture (diffing to find what changed), reports the
-    /// change as DAMAGE, and schedules the next capture for this output.
+    /// Blits a completed capture, diffing to find what changed, reports it as
+    /// DAMAGE, and schedules this output's next capture.
     fn frame_ready(
         &mut self,
         wl_name: u32,
         frame: &ZwlrScreencopyFrameV1,
         _qh: &QueueHandle<State>,
     ) {
-        // Only diff (the expensive per-frame compare) when a client actually has
-        // a DAMAGE object; otherwise we just refresh the framebuffer for polled
-        // GetImage/ShmGetImage reads and skip computing damage nobody consumes.
+        // only pay for the per-frame compare when a client actually holds a
+        // DAMAGE object; otherwise just refresh the framebuffer for polled
+        // GetImage/ShmGetImage reads
         let compute_damage = self.server.damage.active();
         let (mut bbox, mut blit_wait, mut blit_work) = (None, 0u64, 0u64);
         if let Some(ctx) = self.ctxs.get(&wl_name)
@@ -129,13 +128,12 @@ impl ScreencopyCapture {
                 .req_at
                 .take()
                 .map_or(0, |t| t.elapsed().as_nanos() as u64);
-            // Pace to the rate the consumer actually wants frames, then back off
-            // geometrically toward the slow rate. With damage that signal is a
-            // pixel change; without damage (the client polls reads, and we can't
-            // tell what changed without the compare we deliberately skip) it is
-            // whether the client read our last frame — so we don't keep blitting
-            // 25MB frames the client never pulls. The read-gate stops capture
-            // entirely once the client stops reading.
+            // Pace to the rate the consumer actually wants, backing off
+            // geometrically toward the slow rate. With damage the signal is a
+            // pixel change; without it we can't tell what changed (that's the
+            // compare we deliberately skipped), so the signal is whether the
+            // client read the last frame — otherwise we'd blit 25MB frames nobody
+            // pulls. The read gate then stops capture entirely.
             let keep_fast = if compute_damage {
                 bbox.is_some()
             } else {
@@ -209,7 +207,7 @@ impl ScreencopyCapture {
                     ctx.y_invert = flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
                 }
             }
-            // We use plain `copy`, so no Damage events arrive; we diff instead.
+            // plain `copy` sends no Damage events, so there is nothing to collect
             Event::Ready { .. } => self.frame_ready(wl_name, frame, qh),
             Event::Failed => self.frame_failed(wl_name, frame, qh),
             _ => {}
@@ -230,8 +228,8 @@ impl CaptureBackend for ScreencopyCapture {
             crate::log!("using zwlr-screencopy-v1 for screen capture");
         }
         for (name, output) in new {
-            // Physical position once the output has been synced; apply_output
-            // corrects it on the first wl_output `done` otherwise.
+            // the physical position, if the output has synced; otherwise
+            // apply_output corrects it on the first wl_output `done`
             let (x, y) = self
                 .server
                 .screen

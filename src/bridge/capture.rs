@@ -1,11 +1,10 @@
-//! The shared virtual framebuffer: real Wayland outputs are captured (via
-//! wlr-screencopy) and composited here at their layout positions, and X
-//! `GetImage`/MIT-SHM reads pull rectangles back out.
+//! The shared virtual framebuffer. Captured outputs are composited in at their
+//! layout positions, and X `GetImage`/MIT-SHM reads pull rectangles back out.
 //!
-//! Pixels are stored as 32-bit little-endian XRGB (byte order B, G, R, X),
-//! which matches both wl_shm `Xrgb8888`/`Argb8888` and our X TrueColor visual
-//! (depth 24, bpp 32, masks R=0xff0000 G=0xff00 B=0xff, LSBFirst), so no
-//! conversion is needed.
+//! Pixels are 32-bit little-endian XRGB (byte order B, G, R, x), which is both
+//! wl_shm `Xrgb8888`/`Argb8888` and our X TrueColor visual (depth 24, bpp 32,
+//! R=0xff0000 G=0xff00 B=0xff, LSBFirst), so the common case needs no
+//! conversion.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -13,55 +12,41 @@ use std::time::Instant;
 
 use x11rb_protocol::protocol::xproto::Rectangle;
 
-/// Source byte offsets, within a 4-byte little-endian pixel, of the blue, green
-/// and red channels — enough to convert any byte-ordered 8888 wl_shm format into
-/// our XRGB framebuffer. [`XRGB`] is the native identity (fast path).
+/// Blue, green and red source byte offsets within a 4-byte little-endian pixel,
+/// enough to convert any byte-ordered 8888 wl_shm format into our framebuffer.
 pub type ChannelMap = [usize; 3];
-/// Identity map for `Xrgb8888`/`Argb8888` (memory order B,G,R,_).
+
+/// Identity map for `Xrgb8888`/`Argb8888` (memory order B,G,R,x), the fast path.
 pub const XRGB: ChannelMap = [0, 1, 2];
 
+#[derive(Default)]
 pub struct Framebuffer {
     inner: Mutex<Fb>,
-    /// `now_ms()` of the most recent `read_rect` (a client pulling pixels). Used
-    /// to gate the capture loop: we only capture while a client is watching.
-    last_read_ms: AtomicU64,
+    last_read_ms: AtomicU64, // `now_ms()` of the last read, 0 if never read
 }
 
+#[derive(Default)]
 struct Fb {
     width: u32,
     height: u32,
     data: Vec<u8>,
 }
 
-impl Default for Framebuffer {
-    fn default() -> Self {
-        Self {
-            inner: Mutex::new(Fb {
-                width: 0,
-                height: 0,
-                data: Vec::new(),
-            }),
-            last_read_ms: AtomicU64::new(0),
-        }
-    }
-}
-
-/// Milliseconds since the first call (a cheap monotonic clock for the read gate).
+/// Milliseconds since the first call: a cheap monotonic clock for the read gate.
 fn now_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 impl Framebuffer {
-    /// Whether a client has read pixels within the last `ms` milliseconds. A
-    /// stored value of 0 means "never read" (the sentinel from construction).
+    /// Whether a client has read pixels within the last `ms` milliseconds.
     pub fn read_within(&self, ms: u64) -> bool {
         let last = self.last_read_ms.load(Ordering::Relaxed);
         last != 0 && now_ms().saturating_sub(last) < ms
     }
 
-    /// Timestamp (`now_ms`) of the most recent read, or 0 if never read. Used to
-    /// pace no-damage capture to the rate the client actually polls.
+    /// When the last read happened, for pacing no-damage capture to the rate the
+    /// client actually polls. 0 if never read.
     pub fn last_read_ms(&self) -> u64 {
         self.last_read_ms.load(Ordering::Relaxed)
     }
@@ -76,27 +61,22 @@ impl Framebuffer {
         }
     }
 
-    /// Composites a captured output into the framebuffer at `(ox, oy)`.
+    /// Composites a captured output into the framebuffer at `(ox, oy)`, where
+    /// `src` is `src_height` rows of `src_stride` bytes in `chan` order ([`XRGB`]
+    /// takes the fast memcpy path, anything else is shuffled per pixel).
+    /// Returns `(changed_bbox, lock_wait_ns, work_ns)`.
     ///
-    /// When `compute_damage` is set, each row is compared against the framebuffer
-    /// and only changed rows are copied, returning the bounding box of the change
-    /// (root coords) or `None` if identical. When it is clear, the whole overlap
-    /// is copied unconditionally (no per-row compare) and `None` is returned —
-    /// this is for clients that poll `GetImage`/`ShmGetImage` without a DAMAGE
-    /// object, where the bbox would be thrown away and the compare (the dominant
-    /// cost: it reads both buffers in full every frame) is pure waste.
+    /// With `compute_damage`, rows are compared and only changed ones copied, and
+    /// the bbox of the change comes back in root coords. Without it the whole
+    /// overlap is copied blind and the bbox is `None` — for clients polling
+    /// `GetImage`/`ShmGetImage` with no DAMAGE object, the compare reads both
+    /// buffers in full every frame to produce a bbox nobody reads.
     ///
-    /// We drive the compositor with plain `copy` (not `copy_with_damage`) because
-    /// niri delivers `copy_with_damage` frames on its own damage-gated repaint
-    /// schedule with very spiky latency (hundreds of ms when the screen is mostly
-    /// still), which the VNC client sees as stutter, and it misses cursor-plane
-    /// movement. Plain `copy` answers immediately and steadily.
-    ///
-    /// `src` is `src_height` rows of `src_stride` bytes. `chan` gives the source
-    /// byte offsets of the blue, green and red channels within each 4-byte pixel
-    /// (see [`ChannelMap`]); [`XRGB`] is the identity and takes the fast memcpy
-    /// path, any other permutation (e.g. sway's XBGR) is shuffled per pixel into
-    /// our XRGB framebuffer. Returns `(changed_bbox, lock_wait_ns, work_ns)`.
+    /// **Why plain `copy` and not `copy_with_damage`:** niri delivers
+    /// `copy_with_damage` frames on its own damage-gated repaint schedule, with
+    /// latency spiking to hundreds of ms on a mostly-still screen (which reads as
+    /// stutter) and cursor-plane movement missed entirely. Plain `copy` answers
+    /// immediately and steadily.
     #[allow(clippy::too_many_arguments)]
     pub fn blit_diff(
         &self,
@@ -116,7 +96,7 @@ impl Framebuffer {
         let t1 = Instant::now();
         let (fw, fh) = (fb.width as i32, fb.height as i32);
         let dst_stride = fb.width as usize * 4;
-        // Horizontal overlap of the source with the framebuffer.
+        // horizontal overlap of the source with the framebuffer
         let dx0 = ox.max(0);
         let dx1 = (ox + src_width as i32).min(fw);
         if dx1 <= dx0 {
@@ -124,8 +104,8 @@ impl Framebuffer {
         }
         let n = (dx1 - dx0) as usize * 4;
         let src_col = (dx0 - ox) as usize * 4;
-        // y-range of changed rows (x-range is the full overlap; an over-report on
-        // x is harmless — vncagent re-reads the whole screen on any damage).
+        // y-range of changed rows; x is always the full overlap, and over-reporting
+        // it is harmless since vncagent re-reads the whole screen on any damage
         let (mut min_y, mut max_y) = (i32::MAX, i32::MIN);
         for row in 0..src_height as i32 {
             let dy = oy + row;
@@ -143,15 +123,15 @@ impl Framebuffer {
                 continue;
             }
             if chan == XRGB {
-                // Native order: skip the (expensive) compare when no one wants
-                // damage, otherwise compare the whole row and copy if changed.
+                // native order, so skip the expensive compare when nobody wants
+                // damage, otherwise compare the whole row and copy if changed
                 if compute_damage && fb.data[d..d + n] == src[s..s + n] {
                     continue;
                 }
                 fb.data[d..d + n].copy_from_slice(&src[s..s + n]);
             } else {
-                // Foreign byte order: shuffle each pixel into XRGB. Track per-row
-                // change so damage reporting still works.
+                // foreign byte order, so shuffle each pixel into XRGB, tracking
+                // per-row change so damage reporting still works
                 let [bi, gi, ri] = chan;
                 let mut changed = false;
                 let mut p = 0;
@@ -187,9 +167,8 @@ impl Framebuffer {
         (bbox, wait_ns, t1.elapsed().as_nanos() as u64)
     }
 
-    /// Reads a rectangle as `height` rows of `width*4` XRGB bytes, zero-filled
-    /// outside the framebuffer, into a freshly allocated buffer. Used by the
-    /// non-shm `GetImage` path, whose reply owns the returned `Vec`.
+    /// [`read_rect_into`](Self::read_rect_into) with a freshly allocated buffer,
+    /// for the non-shm `GetImage` path whose reply owns the returned `Vec`.
     pub fn read_rect(&self, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
         let row_bytes = width as usize * 4;
         let mut out = vec![0u8; row_bytes * height as usize];
@@ -197,16 +176,14 @@ impl Framebuffer {
         out
     }
 
-    /// Reads a rectangle directly into `dst` (`height` rows of `width*4` bytes),
-    /// writing *every* byte of `dst`: the in-bounds overlap is one memcpy per
-    /// row, and any out-of-bounds margin/rows are zeroed. This is exactly the
-    /// ZPixmap depth-24/bpp-32 X image layout for our visual.
+    /// Reads a rectangle into `dst` as `height` rows of `width*4` bytes — exactly
+    /// the ZPixmap depth-24/bpp-32 layout for our visual. Every byte of `dst` is
+    /// written: one memcpy per row for the in-bounds overlap, zeroes for any
+    /// margin outside it.
     ///
-    /// The shm `GetImage` path points `dst` straight at the client's shared
-    /// segment, so the captured pixels make a single copy out of the
-    /// framebuffer — no intermediate allocation, zero-fill, or second copy.
-    /// For a full-screen read (the VNC agent's case) there is no margin, so it
-    /// is just one memcpy per row.
+    /// The shm path points `dst` straight at the client's shared segment, so a
+    /// full-screen read (what vncagent does ~20/sec) is one memcpy per row out of
+    /// the framebuffer and nothing else.
     pub fn read_rect_into(&self, x: i32, y: i32, width: u32, height: u32, dst: &mut [u8]) {
         self.last_read_ms.store(now_ms(), Ordering::Relaxed);
         let t0 = Instant::now();
@@ -215,7 +192,7 @@ impl Framebuffer {
         let t1 = Instant::now();
         let row_bytes = width as usize * 4;
         let stride = fb.width as usize * 4;
-        // Horizontal overlap of the requested rect with the framebuffer.
+        // horizontal overlap of the requested rect with the framebuffer
         let sx0 = x.max(0);
         let sx1 = (x + width as i32).min(fb.width as i32);
         let (copy_n, dst_col) = if sx1 > sx0 {
@@ -223,8 +200,8 @@ impl Framebuffer {
         } else {
             (0, 0)
         };
-        // Only whole rows that fit in `dst` are written; a short `dst` (smaller
-        // shm segment than requested) just truncates.
+        // only whole rows that fit in `dst` are written, so a short `dst` (a
+        // smaller shm segment than requested) just truncates
         let rows = (dst.len() / row_bytes).min(height as usize);
         for row in 0..rows {
             let drow = &mut dst[row * row_bytes..row * row_bytes + row_bytes];

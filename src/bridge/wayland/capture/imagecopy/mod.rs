@@ -1,10 +1,10 @@
 //! `ext-image-copy-capture-v1` capture backend.
 //!
-//! Each output gets a capture session that negotiates buffer size/format and
-//! then delivers damage-tracked frames; the compositor tells us what changed, so
-//! (unlike the wlr path) we don't diff. This protocol also exposes a per-output
-//! cursor session, used to capture the cursor image separately and report it via
-//! XFixes (unless `-cursor none` bakes it into the screen frames instead).
+//! Each output gets a session that negotiates buffer size and format, then
+//! delivers damage-tracked frames. The compositor says what changed, so unlike
+//! the wlr path there is nothing to diff. The protocol also offers a per-output
+//! [`cursor`] session, for capturing the cursor separately and reporting it over
+//! XFixes — unless `-cursor none` bakes it into the screen frames instead.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -28,30 +28,30 @@ use super::*;
 mod cursor;
 use cursor::CursorCap;
 
-/// Per-output capture state for the ext path.
+/// One output's capture state, screen session and cursor session both.
 struct Ctx {
     output: wl_output::WlOutput,
     x: i32,
     y: i32,
     buffer: Option<ShmBuffer>,
-    /// A capture has been requested and we're awaiting its `ready`/`failed`.
+    /// A capture is out, awaiting its `ready`/`failed`.
     in_flight: bool,
-    /// Earliest time the next capture for this output should be requested.
+    /// Earliest the next capture may be requested.
     next_at: Instant,
-    /// When the in-flight capture was requested (latency profiling).
+    /// When the in-flight capture went out, for latency profiling.
     req_at: Option<Instant>,
     source: Option<ExtImageCaptureSourceV1>,
     session: Option<ExtImageCopyCaptureSessionV1>,
-    /// True once the session has sent its `done` event after constraint negotiation.
+    /// Set once the session's `done` closes constraint negotiation.
     session_ready: bool,
-    /// Buffer geometry advertised by the session's `buffer_size` event.
+    /// Geometry from the session's `buffer_size` event.
     session_size: Option<(u32, u32)>,
-    /// Shm format to use, picked from the session's `shm_format` events.
+    /// Format picked from the session's `shm_format` events.
     session_format: Option<wl_shm::Format>,
-    /// Damage rects accumulated from the current frame's `damage` events
-    /// (buffer coords; converted to root coords before reporting to DAMAGE).
+    /// Rects from this frame's `damage` events, in buffer coordinates. Converted
+    /// to root coordinates before they reach DAMAGE.
     frame_damage: Vec<(i32, i32, i32, i32)>,
-    /// Per-output cursor capture state.
+    /// `None` when `-cursor none` bakes the cursor into the screen frames.
     cursor_cap: Option<CursorCap>,
 }
 
@@ -60,7 +60,7 @@ pub(crate) struct ImageCopyCapture {
     shm: wl_shm::WlShm,
     source_mgr: ExtOutputImageCaptureSourceManagerV1,
     cap_mgr: ExtImageCopyCaptureManagerV1,
-    /// Passive pointer for `create_pointer_cursor_session`; learned at seat select.
+    /// Passive pointer for `create_pointer_cursor_session`, learned at seat select.
     pointer: Option<wl_pointer::WlPointer>,
     ctxs: HashMap<u32, Ctx>,
 }
@@ -94,9 +94,9 @@ impl ImageCopyCapture {
             return;
         };
         let source = source_mgr.create_source(&output, qh, ());
-        // `-cursor none` composites the cursor into the screen frames (we then
-        // report a transparent XFixes cursor so the agent doesn't double-draw);
-        // otherwise it's captured separately and delivered via XFixes.
+        // `-cursor none` composites the cursor into the screen frames, and we
+        // then report a transparent XFixes cursor so the agent doesn't draw a
+        // second one; otherwise it is captured separately and sent over XFixes
         let bake = self.server.config.cursor == crate::config::CursorType::Baked;
         let options = if bake {
             CaptureOptions::PaintCursors
@@ -105,8 +105,8 @@ impl ImageCopyCapture {
         };
         let session = cap_mgr.create_session(&source, options, qh, wl_name);
 
-        // Cursor session: one per output so we get position events for whichever
-        // output the pointer is currently on. Skipped when baking.
+        // one cursor session per output, so position events arrive from whichever
+        // one the pointer is on
         let cursor_cap = self
             .pointer
             .as_ref()
@@ -125,7 +125,7 @@ impl ImageCopyCapture {
     }
 
     fn start_capture_ext(&mut self, wl_name: u32, qh: &QueueHandle<State>) {
-        // Determine the action without holding a mutable borrow.
+        // decide what to do without holding a mutable borrow
         enum Action {
             NeedSession,
             WaitConstraints,
@@ -205,8 +205,7 @@ impl ImageCopyCapture {
             && let Some(b) = &ctx.buffer
         {
             let slice = unsafe { std::slice::from_raw_parts(b.map, b.size) };
-            // Blit the frame into the shared framebuffer; skip the diff since
-            // the compositor gives us damage rects directly.
+            // no diff needed, the compositor hands us damage rects directly
             let (_, w, wk) = self.server.framebuffer.blit_diff(
                 ctx.x,
                 ctx.y,
@@ -221,7 +220,7 @@ impl ImageCopyCapture {
             blit_wait = w;
             blit_work = wk;
         }
-        // Convert compositor damage (buffer-local coords) to virtual-screen coords.
+        // compositor damage is buffer-local, so shift it into virtual-screen coords
         let compositor_rects: Vec<Rectangle> = if compute_damage {
             self.ctxs.get(&wl_name).map_or(Vec::new(), |ctx| {
                 ctx.frame_damage
@@ -256,8 +255,8 @@ impl ImageCopyCapture {
             self.server.damage.add_damage(&compositor_rects, geom);
         }
         frame.destroy();
-        // Immediately requeue so the compositor can hold the next frame request
-        // until content changes (the equivalent of our self-paced wlr loop).
+        // requeue at once so the compositor can hold the request until content
+        // changes, which is this path's answer to the self-paced wlr loop
         if capture_enabled(&self.server) {
             self.start_capture_ext(wl_name, qh);
         }
@@ -280,13 +279,12 @@ impl ImageCopyCapture {
             ctx.in_flight = false;
             ctx.req_at = None;
             ctx.next_at = Instant::now() + SLOW_INTERVAL;
-            // On buffer-constraints (e.g. the output resized) the session re-sends
-            // its constraints via its own `done` and we just need a buffer that
-            // matches them. Drop the stale buffer so the paced retry recreates it
-            // against the current `session_size`. Do NOT clear `session_ready` /
-            // `session_size` here: the re-negotiation `done` may already have been
-            // delivered, and clearing it would leave us waiting for a `done` that
-            // never comes — stalling capture for good.
+            // On buffer-constraints — the output resized, say — the session
+            // re-sends its constraints in its own `done`, and all we need is a
+            // buffer matching them, so drop the stale one and let the paced retry
+            // rebuild it against the current `session_size`. Do NOT also clear
+            // `session_ready`/`session_size`: that `done` may already have been
+            // delivered, and we would wait forever for one that never comes.
             if matches!(
                 reason,
                 WEnum::Value(ext_frame_v1::FailureReason::BufferConstraints)
@@ -295,11 +293,11 @@ impl ImageCopyCapture {
             }
         }
         frame.destroy();
-        // tick → start_capture_ext recreates the buffer and retries.
+        // tick -> start_capture_ext rebuilds the buffer and retries
         let _ = qh;
     }
 
-    /// Handles a screen capture session event (buffer-size/format negotiation).
+    /// Handles a screen session event, which is buffer size/format negotiation.
     fn screen_session_event(
         &mut self,
         wl_name: u32,
@@ -317,10 +315,9 @@ impl ImageCopyCapture {
                 if let WEnum::Value(fmt) = format
                     && let Some(ctx) = self.ctxs.get_mut(&wl_name)
                 {
-                    // Prefer Xrgb8888 (zero-conversion); otherwise the first
-                    // byte-permutable format we can convert; only fall back to an
-                    // unconvertible (packed/float) format if nothing better is
-                    // offered.
+                    // prefer Xrgb8888, which needs no conversion, then anything
+                    // byte-permutable, and only settle for a packed or float
+                    // format if nothing better is offered
                     let better = match ctx.session_format {
                         None => true,
                         Some(wl_shm::Format::Xrgb8888) => false,
@@ -345,7 +342,7 @@ impl ImageCopyCapture {
                     crate::log!("ext capture output {wl_name} using shm format {fmt:?}");
                     ctx.session_ready = true;
                 }
-                // Kick off the first frame now that constraints are known.
+                // constraints are known, so kick off the first frame
                 self.start_capture_ext(wl_name, qh);
             }
             Event::Stopped => {
@@ -358,13 +355,13 @@ impl ImageCopyCapture {
                     ctx.in_flight = false;
                     ctx.next_at = Instant::now() + SLOW_INTERVAL;
                 }
-                // tick → start_capture_ext will recreate the session.
+                // tick -> start_capture_ext will recreate the session
             }
             _ => {}
         }
     }
 
-    /// Handles a screen capture frame event (the captured screen image + damage).
+    /// Handles a screen frame event: the captured image, and its damage.
     fn screen_frame_event(
         &mut self,
         wl_name: u32,
@@ -431,9 +428,8 @@ impl CaptureBackend for ImageCopyCapture {
                 },
             );
         }
-        // Create sessions for any output that doesn't have one yet. This handles
-        // both new outputs and the case where ext managers arrive after outputs
-        // were already registered.
+        // catch up any output without a session, which covers both new outputs
+        // and managers that arrived after the outputs did
         let needs_session: Vec<u32> = self
             .ctxs
             .iter()

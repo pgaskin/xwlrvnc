@@ -1,13 +1,35 @@
-//! Output (monitor) tracking: mirrors the compositor's `wl_output` /
-//! `zxdg_output` state into [`OutputAcc`](super::OutputAcc) and, on each `done`,
-//! recomputes the virtual-screen layout that drives the X RandR model, the
-//! framebuffer size, the per-output capture positions, and the input remap.
+//! Output tracking: accumulates each `wl_output`/`zxdg_output` into an
+//! [`OutputAcc`] and, on every `done`, recomputes the virtual-screen layout that
+//! drives the RandR model, the framebuffer size, the capture positions and the
+//! input remap.
 
 use super::*;
 
+/// One output's events, accumulated until its `done`. Wayland delivers geometry
+/// piecemeal across two protocols, so nothing here is trustworthy mid-batch.
+#[derive(Default)]
+pub(super) struct OutputAcc {
+    pub proxy: Option<wl_output::WlOutput>,
+    pub xdg: Option<ZxdgOutputV1>, // created once the manager is available
+    pub x: i32,                    // wl_output geometry position, a scale-1 fallback
+    pub y: i32,
+    pub width: i32, // physical mode resolution, from the Mode event
+    pub height: i32,
+    pub refresh_mhz: i32,
+    /// Integer scale from wl_output, 0 if unset. Only approximates the logical
+    /// size when xdg-output is missing; xdg-output is preferred because it
+    /// reports the true, possibly fractional, size.
+    pub scale: i32,
+    pub logical_x: Option<i32>, // from xdg-output, if it arrived
+    pub logical_y: Option<i32>,
+    pub logical_width: Option<i32>,
+    pub logical_height: Option<i32>,
+    pub name: Vec<u8>,
+}
+
 impl State {
-    /// Creates the xdg-output for an output once both the output proxy and the
-    /// xdg-output manager exist. Idempotent.
+    /// Creates an output's xdg-output once both it and the manager exist.
+    /// Idempotent, since either can arrive first.
     pub(super) fn ensure_xdg_output(&mut self, wl_name: u32, qh: &QueueHandle<Self>) {
         let Some(mgr) = &self.xdg_output_mgr else {
             return;
@@ -29,11 +51,10 @@ impl State {
         if acc.width <= 0 || acc.height <= 0 {
             return;
         }
-        // Logical rect drives the layout topology: prefer xdg-output (accurate
-        // under fractional scaling). Without it, fall back to the wl_output
-        // geometry position and a logical size derived from the integer scale
-        // (mode / scale) — correct for unscaled and integer-scaled outputs;
-        // fractional scales still need xdg-output.
+        // The logical rect drives the layout topology, so prefer xdg-output,
+        // which is accurate under fractional scaling. Falling back to wl_output
+        // geometry and mode/scale is correct for unscaled and integer-scaled
+        // outputs, but fractional scales really do need xdg-output.
         let scale = acc.scale.max(1);
         let lx = acc.logical_x.unwrap_or(acc.x);
         let ly = acc.logical_y.unwrap_or(acc.y);
@@ -61,12 +82,12 @@ impl State {
         self.server
             .framebuffer
             .ensure(u32::from(geom.0), u32::from(geom.1));
-        // A relayout can shift other outputs' physical positions too, so refresh
-        // every capture context from the recomputed layout, not just this one.
+        // a relayout can shift other outputs too, so refresh every capture
+        // context from the new layout rather than just this one
         let positions: Vec<(u32, (i32, i32))> = {
             let s = self.server.screen.lock().unwrap();
-            // Feed the physical↔logical layout to the input path so absolute
-            // pointer motion maps to logical coordinates (correct under scaling).
+            // hand the layout to the input path so absolute motion resolves in
+            // logical coordinates, which is what scaling needs
             self.server.input.set_layout(s.layout_rects());
             self.capture.positions(&s)
         };
@@ -99,9 +120,9 @@ impl State {
                 positions,
             )
         };
-        // Resize the framebuffer and refresh the remaining outputs' positions and
-        // input layout — removing an output can shrink the screen and shift the
-        // others (same work apply_output does when an output is added/changed).
+        // Removing an output can shrink the screen and shift the rest, so resize
+        // the framebuffer and refresh the survivors' positions and input layout
+        // — the same work apply_output does on add or change.
         self.server
             .framebuffer
             .ensure(u32::from(geom.0), u32::from(geom.1));

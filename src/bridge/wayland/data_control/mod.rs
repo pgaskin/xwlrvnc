@@ -1,13 +1,11 @@
 //! Clipboard bridge over the data-control protocols: `ext-data-control-v1`
 //! (preferred) or `zwlr-data-control-v1` (fallback).
 //!
-//! The two protocols are byte-for-byte equivalent for our purposes, so the
-//! manager-specific bits (creating the device/source, setting selections) live
-//! behind the [`DataControlManager`] trait — implemented per protocol in the
-//! [`ext`] and [`wlr`] submodules — and the X→Wayland source factory is written
-//! once, generically, in [`install_source_factory`]. The per-interface
-//! `Dispatch` impls (also in the submodules) stay concrete but defer to the
-//! shared [`State::update_selection`] bookkeeping.
+//! The two are equivalent for our purposes, so the manager-specific bits live
+//! behind the [`DataControlManager`] trait, implemented per protocol in [`ext`]
+//! and [`wlr`], and the X-to-Wayland source factory is written once over that
+//! trait in [`install_source_factory`]. The `Dispatch` impls have to stay
+//! concrete, but they all defer to [`State::update_selection`].
 
 use wayland_client::protocol::wl_seat;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1::ExtDataControlDeviceV1;
@@ -18,29 +16,27 @@ use super::*;
 mod ext;
 mod wlr;
 
-/// Opcode of the `data_offer` event on both data-control device interfaces
-/// (creates a child offer object); same value for wlr and ext.
+/// Opcode of the `data_offer` event, which creates the child offer object. The
+/// same value on both device interfaces.
 const DATA_OFFER_OPCODE: u16 = 0;
 
-/// The live data-control device, whichever protocol we negotiated. The inner
-/// proxy is kept alive (not read) so the compositor doesn't destroy the device.
+/// The live device, whichever protocol won. Held rather than read: dropping the
+/// proxy would destroy the device.
 #[allow(dead_code)]
 pub(crate) enum DataDevice {
     Ext(ExtDataControlDeviceV1),
     Wlr(ZwlrDataControlDeviceV1),
 }
 
-/// The manager-side of a data-control protocol: enough to create the per-seat
-/// device, mint a source for an X-owned selection, and publish it. Implemented
-/// for both the ext and wlr managers (in [`ext`] / [`wlr`]) so the X→Wayland
-/// source factory is shared.
+/// The manager side of a data-control protocol: enough to create the per-seat
+/// device, mint a source for an X-owned selection, and publish it.
 trait DataControlManager: Clone + Send + Sync + 'static {
     type Device: Clone + Send + Sync + 'static;
     type Source: Clone;
 
-    /// Binds the device for `seat` (kept alive in [`DataDevice`]).
+    /// Binds the device for `seat`, kept alive in [`DataDevice`].
     fn create_device(&self, seat: &wl_seat::WlSeat, qh: &QueueHandle<State>) -> Self::Device;
-    /// Mints a source tagged with `sel` (its `Dispatch` userdata).
+    /// Mints a source tagged with `sel` as its `Dispatch` userdata.
     fn create_source(&self, qh: &QueueHandle<State>, sel: Sel) -> Self::Source;
     /// Advertises a mime type on the source.
     fn offer(source: &Self::Source, mime: String);
@@ -48,9 +44,8 @@ trait DataControlManager: Clone + Send + Sync + 'static {
     fn set_selection(device: &Self::Device, sel: Sel, source: &Self::Source);
 }
 
-/// Installs the X→Wayland source factory: when X takes a selection, mint a
-/// data-control source advertising our text mimes and publish it. Written once
-/// over any [`DataControlManager`].
+/// Installs the source factory: when X takes a selection, mint a data-control
+/// source advertising our text mimes and publish it.
 fn install_source_factory<M: DataControlManager>(
     mgr: M,
     device: M::Device,
@@ -70,14 +65,14 @@ fn install_source_factory<M: DataControlManager>(
 
 impl State {
     pub(super) fn try_init_device(&mut self, conn: &Connection, qh: &QueueHandle<Self>) {
-        // If we already have an ext device, nothing to do — it's already optimal.
+        // an ext device is already the best we can do
         if matches!(self.device, Some(DataDevice::Ext(_))) {
             return;
         }
         let Some(seat) = &self.seat else { return };
 
         if let Some(mgr) = &self.ext_manager {
-            // ext-data-control-v1 is preferred; replace any existing wlr device.
+            // ext is preferred, so replace any wlr device we already made
             crate::log!("using ext-data-control-v1");
             let device = mgr.create_device(seat, qh);
             install_source_factory(
@@ -103,10 +98,10 @@ impl State {
         }
     }
 
-    /// Records a clipboard/primary selection change and notifies X clients.
+    /// Records a selection change and notifies the X clients watching it.
     pub(super) fn update_selection(&mut self, sel: Sel, offer: Option<DataOffer>) {
-        // With -noprimary, ignore the Wayland PRIMARY selection entirely (just
-        // tidy up the offer the compositor handed us).
+        // with -noprimary, ignore PRIMARY entirely and just tidy up the offer
+        // the compositor handed us
         if sel == Sel::Primary && self.server.config.noprimary {
             if let Some(o) = offer {
                 self.offer_mimes.remove(&o.id());

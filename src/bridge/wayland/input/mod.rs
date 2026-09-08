@@ -1,18 +1,15 @@
-//! Virtual input: creates the per-seat virtual pointer/keyboard devices once a
-//! backend and the seat are available, and forwards the compositor keymap to the
-//! virtual keyboard.
+//! Virtual input: mints the per-seat pointer and keyboard once a backend and the
+//! seat exist, and forwards the compositor keymap to the keyboard.
 //!
-//! A backend is whatever bound manager global can mint a device for a seat —
-//! [`PointerBackend`] for the pointer, [`KeyboardBackend`] for the keyboard. The
-//! current backends are `zwlr_virtual_pointer_v1` ([`wlr`]) and
-//! `zwp_virtual_keyboard_v1` ([`zwp`]); a libei backend (which would provide
-//! both) can slot in as another module. The created devices are handed to
-//! [`crate::bridge::input::Input`] as [`VirtualPointer`](crate::bridge::input::VirtualPointer) /
-//! [`VirtualKeyboard`](crate::bridge::input::VirtualKeyboard) trait objects, so the input
-//! translation layer is decoupled from the backing protocol.
+//! A backend is any bound manager global that can mint a device for a seat —
+//! [`PointerBackend`] and [`KeyboardBackend`], currently
+//! `zwlr_virtual_pointer_v1` ([`wlr`]) and `zwp_virtual_keyboard_v1` ([`zwp`]).
+//! A libei backend, which would provide both, can slot in as another module. The
+//! devices reach [`crate::bridge::input::Input`] as trait objects, so the
+//! translation layer never sees which protocol won.
 //!
-//! The input proxies carry no events (all `delegate_noop`), so there is no
-//! per-backend `Dispatch` routing — the backends are plain factory trait objects.
+//! The input proxies carry no events, all `delegate_noop`, so the backends are
+//! plain factories with no `Dispatch` routing of their own.
 
 use wayland_client::protocol::wl_seat;
 
@@ -23,10 +20,10 @@ use super::*;
 mod wlr;
 mod zwp;
 
-/// wl_keyboard/virtual_keyboard keymap format for an xkb v1 text keymap.
+/// The wl_keyboard/virtual_keyboard format value for an xkb v1 text keymap.
 const KEYMAP_FORMAT_XKB_V1: u32 = 1;
 
-/// A bound manager global that can mint a virtual pointer for a seat.
+/// A manager global that can mint a virtual pointer for a seat.
 pub(crate) trait PointerBackend: Send {
     fn create_pointer(
         &self,
@@ -35,7 +32,7 @@ pub(crate) trait PointerBackend: Send {
     ) -> Box<dyn VirtualPointer>;
 }
 
-/// A bound manager global that can mint a virtual keyboard for a seat.
+/// A manager global that can mint a virtual keyboard for a seat.
 pub(crate) trait KeyboardBackend: Send {
     fn create_keyboard(
         &self,
@@ -45,8 +42,8 @@ pub(crate) trait KeyboardBackend: Send {
 }
 
 impl State {
-    /// Creates the virtual pointer + keyboard once the seat and both backends are
-    /// available, and forwards any keymap we've already seen.
+    /// Creates both devices once the seat and both backends exist, then forwards
+    /// any keymap already seen.
     pub(super) fn try_init_virtual_input(&mut self, conn: &Connection, qh: &QueueHandle<Self>) {
         if self.virtual_input_ready {
             return;
@@ -80,10 +77,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         if let wl_keyboard::Event::Keymap { format, fd, size } = event
             && format == WEnum::Value(wl_keyboard::KeymapFormat::XkbV1)
         {
-            // Read the keymap text first so we can dedup. Forwarding a keymap to
-            // our virtual keyboard makes sway re-broadcast the same keymap to our
-            // passive wl_keyboard; ignoring an unchanged keymap breaks that
-            // feedback loop (which otherwise spams + exhausts fds: ETOOMANYREFS).
+            // Read the text first, to dedup. Forwarding a keymap to our virtual
+            // keyboard makes sway re-broadcast it to our passive wl_keyboard, and
+            // ignoring an unchanged keymap is what breaks that loop before it
+            // exhausts in-flight fds (ETOOMANYREFS).
             let Some(text) = (match fd.try_clone() {
                 Ok(dup) => read_keymap(dup, size),
                 Err(_) => None,
@@ -97,12 +94,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 return;
             }
             state.keymap_hash = Some(hash);
-            // Forward the keymap to the virtual keyboard verbatim. The X keymap
-            // we advertise is built from this same keymap (X keycode = evdev+8 =
-            // xkb keycode), so the keycodes the client sends resolve to the same
-            // keysyms — the forward is an identity mapping, but the protocol
-            // requires a keymap be set before any `key` request. A dup is kept so
-            // we can re-forward if the virtual keyboard is created later.
+            // Forward it verbatim. The X keymap we advertise is built from this
+            // same one (X keycode = evdev+8 = xkb keycode), so this is an identity
+            // mapping — but the protocol demands a keymap before any `key`. Keep a
+            // dup in case the virtual keyboard shows up later.
             if let Ok(dup) = fd.try_clone() {
                 state
                     .server
@@ -110,15 +105,15 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     .set_keymap(KEYMAP_FORMAT_XKB_V1, dup.as_fd(), size);
                 state.vkbd_keymap = Some((KEYMAP_FORMAT_XKB_V1, dup, size));
             }
-            // Track modifier state from this keymap so chords (Ctrl+C etc.)
-            // produce `modifiers` updates on the virtual keyboard.
+            // track modifier state from it, so chords like Ctrl+C produce
+            // `modifiers` updates on the virtual keyboard
             state.server.input.set_modifier_keymap(&text);
             if let Some(table) = crate::bridge::keymap::build(&text) {
                 *state.server.keymap.lock().unwrap() = Some(table);
                 crate::log!("loaded compositor keymap");
-                // Tell X clients the keyboard mapping changed so they re-read it
-                // (vncagent caches keycode→keysym and would otherwise type stale
-                // characters after a compositor layout switch).
+                // tell X clients to re-read the mapping; vncagent caches
+                // keycode->keysym and would otherwise type stale characters after
+                // a compositor layout switch
                 let count =
                     crate::bridge::keymap::MAX_KEYCODE - crate::bridge::keymap::MIN_KEYCODE + 1;
                 state
@@ -130,7 +125,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
     }
 }
 
-/// Reads the null-terminated xkb keymap text from the compositor's fd.
+/// Reads the NUL-terminated xkb keymap text out of the compositor's fd.
 fn read_keymap(fd: OwnedFd, size: u32) -> Option<String> {
     let mut buf = vec![0u8; size as usize];
     File::from(fd).read_exact_at(&mut buf, 0).ok()?;

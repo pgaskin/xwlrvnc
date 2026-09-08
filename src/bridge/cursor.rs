@@ -1,10 +1,7 @@
-//! Shared cursor state written by the Wayland capture thread and read by X
-//! connection threads (for XFixes GetCursorImage / GetCursorImageAndName).
-
 use std::sync::Mutex;
 
-/// Current cursor image and pointer, updated whenever the Wayland cursor
-/// capture session delivers a new frame or position.
+/// Cursor image and position, written by the Wayland capture thread and read by
+/// X connection threads for XFixes `GetCursorImage`/`GetCursorImageAndName`.
 #[derive(Default)]
 pub struct CursorState {
     inner: Mutex<CursorInner>,
@@ -12,20 +9,17 @@ pub struct CursorState {
 
 #[derive(Default)]
 struct CursorInner {
-    /// Monotonically increasing; 0 = no cursor captured yet.
-    pub serial: u32,
-    pub width: u16,
-    pub height: u16,
-    /// Hotspot within the cursor image.
-    pub xhot: u16,
-    pub yhot: u16,
-    /// Cursor hotspot position in virtual-screen (root) coordinates.
-    pub x: i16,
-    pub y: i16,
-    /// ARGB pixels (u32 per pixel, native endian = 0xAARRGGBB on little-endian).
-    pub image: Vec<u32>,
+    serial: u32, // monotonic, 0 if nothing captured yet
+    width: u16,
+    height: u16,
+    xhot: u16, // hotspot within the image
+    yhot: u16,
+    x: i16, // hotspot position in root coordinates
+    y: i16,
+    image: Vec<u32>, // ARGB, native endian (0xAARRGGBB on little-endian)
 }
 
+/// A consistent copy of the cursor, taken under the lock.
 pub struct CursorSnapshot {
     pub serial: u32,
     pub width: u16,
@@ -38,8 +32,8 @@ pub struct CursorSnapshot {
 }
 
 impl CursorState {
-    /// Replaces the cursor image (new dimensions, hotspot, pixels). Returns the
-    /// new serial, which callers should pass to `EventSink::cursor_changed`.
+    /// Replaces the image, returning the new serial for
+    /// [`EventSink::cursor_changed`](crate::bridge::event::EventSink::cursor_changed).
     pub fn update_image(&self, w: u16, h: u16, xhot: u16, yhot: u16, image: Vec<u32>) -> u32 {
         let mut g = self.inner.lock().unwrap();
         g.width = w;

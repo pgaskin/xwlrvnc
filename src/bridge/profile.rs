@@ -1,9 +1,8 @@
-//! Lightweight runtime profiling, enabled by `--prof` (or `XWLRVNC_PROF`).
+//! Lightweight runtime profiling, enabled by `-profile`.
 //!
-//! All hot-path hooks are cheap no-ops unless profiling is enabled. When on, a
-//! dedicated thread prints one consolidated line per second — on its own thread
-//! so it keeps reporting even while the capture or X threads are stalled (which
-//! is exactly the situation we want to catch).
+//! Every hot-path hook is a cheap no-op while disabled. The 1Hz reporter gets
+//! its own thread so it keeps printing even when the capture or X threads are
+//! stalled, which is exactly the case worth catching.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,8 +59,7 @@ impl Stats {
     }
 }
 
-/// `last_ready` persists across reporting windows so the frame-gap is continuous.
-static LAST_READY: Mutex<Option<Instant>> = Mutex::new(None);
+static LAST_READY: Mutex<Option<Instant>> = Mutex::new(None); // outlives the window, so gaps are continuous
 
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
@@ -109,8 +107,8 @@ pub fn start(enabled: bool) {
     });
 }
 
-/// Records one completed capture: time spent waiting for the framebuffer lock,
-/// time spent copying, and the latency from capture request to `ready`.
+/// Records one completed capture: framebuffer lock wait, copy time, and the
+/// latency from capture request to `ready`.
 pub fn frame(blit_wait_ns: u64, blit_copy_ns: u64, req_latency_ns: u64) {
     if !enabled() {
         return;
@@ -133,7 +131,7 @@ pub fn frame(blit_wait_ns: u64, blit_copy_ns: u64, req_latency_ns: u64) {
     s.req_lat_max_ns = s.req_lat_max_ns.max(req_latency_ns);
 }
 
-/// Records one framebuffer read (GetImage / ShmGetImage): bytes, lock wait, hold.
+/// Records one framebuffer read (`GetImage`/`ShmGetImage`).
 pub fn read(bytes: usize, wait_ns: u64, hold_ns: u64) {
     if !enabled() {
         return;
@@ -162,6 +160,6 @@ pub fn damage_subtract() {
 pub fn damage_create(level: u8) {
     if enabled() {
         STATS.lock().unwrap().dmg_create += 1;
-        eprintln!("prof: DamageCreate level={level}");
+        warning!("profile: DamageCreate level={level}");
     }
 }

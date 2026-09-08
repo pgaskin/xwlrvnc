@@ -1,17 +1,17 @@
 //! Builds an X keyboard mapping from the compositor's xkb keymap.
 //!
-//! We report X keycode = evdev code + 8 (which is also what xkb uses), so a key
-//! the VNC agent looks up by keysym maps to a keycode whose `keycode - 8` is the
-//! evdev code our XTest path injects via the virtual keyboard — and the
-//! compositor, using the same keymap (which we forward verbatim to the virtual
-//! keyboard), turns that evdev code back into the expected keysym.
+//! X keycode = evdev code + 8, which is what xkb uses too. So a keysym the
+//! client looks up resolves to a keycode whose `keycode - 8` is the evdev code
+//! XTest injects, and the compositor — running the same keymap, which we forward
+//! verbatim — turns it back into the keysym the client meant.
 
 use xkbcommon_rs::{Context, Keymap, KeymapFormat, State};
 
 /// X keycode range we expose (evdev 0..=247 shifted by 8).
 pub const MIN_KEYCODE: u8 = 8;
 pub const MAX_KEYCODE: u8 = 255;
-/// Keysyms reported per keycode: base, shift, level3 (AltGr), shift+level3.
+
+/// Keysyms per keycode: base, shift, level3 (AltGr), shift+level3.
 pub const SYMS_PER: u8 = 4;
 
 /// Compiles the keymap text and returns the keysym table for keycodes

@@ -1,11 +1,10 @@
 //! Cursor capture for the ext-image-copy backend.
 //!
-//! Each output gets a `pointer_cursor_session` (created alongside its screen
-//! session in [`ImageCopyCapture::create_ext_session`](super::ImageCopyCapture))
-//! that reports the pointer's position/hotspot and a separate image stream for
-//! the cursor itself, which we convert to an X ARGB cursor and publish via
-//! XFixes. Skipped entirely when `-cursor none` bakes the cursor into the screen
-//! frames instead.
+//! Each output's `pointer_cursor_session`, created alongside its screen session
+//! in [`ImageCopyCapture`], carries two things: the
+//! pointer's position and hotspot, and a separate image stream for the cursor
+//! itself, which becomes an X ARGB cursor published over XFixes. None of this
+//! runs when `-cursor none` bakes the cursor into the screen frames.
 
 use wayland_client::protocol::{wl_pointer, wl_shm};
 use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::ExtImageCaptureSourceV1;
@@ -22,36 +21,33 @@ use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_captu
 
 use super::*;
 
-/// Cursor image capture for one output.
-///
-/// The cursor image is identical on all outputs; only the position changes.
-/// Each output's cursor session contributes position updates when the pointer
-/// is on that output (signalled by `enter`/`leave`).
+/// One output's cursor capture. The image is the same on every output and only
+/// the position differs, so each session contributes updates while the pointer
+/// is on it, bracketed by `enter`/`leave`.
 pub(super) struct CursorCap {
-    /// The `ext_image_copy_capture_cursor_session_v1` proxy — delivers
-    /// `enter`, `leave`, `position`, and `hotspot` events. Kept alive so
-    /// the compositor continues sending events; not read directly.
+    /// Source of the `enter`/`leave`/`position`/`hotspot` events. Held rather
+    /// than read: dropping it stops the compositor sending them.
     #[allow(dead_code)]
     cursor_session: ExtImageCopyCaptureCursorSessionV1,
-    /// The image-capture sub-session from `get_capture_session()`.
+    /// The image sub-session, from `get_capture_session()`.
     cap_session: Option<ExtImageCopyCaptureSessionV1>,
     cap_ready: bool,
     cap_size: Option<(u32, u32)>,
     cap_format: Option<wl_shm::Format>,
     buf: Option<ShmBuffer>,
     in_flight: bool,
-    /// Whether the pointer is currently on this output.
+    /// Whether the pointer is on this output right now.
     present: bool,
-    /// Hotspot position within the cursor image.
+    /// Hotspot within the cursor image.
     hotspot: (i32, i32),
-    /// Pointer hotspot in output-local buffer coordinates (None = leave).
+    /// Hotspot in output-local buffer coordinates, `None` after a leave.
     pos: Option<(i32, i32)>,
     frame_damage: Vec<(i32, i32, i32, i32)>,
 }
 
 impl CursorCap {
-    /// Opens a cursor session against an output's capture `source`, plus its
-    /// image-capture sub-session.
+    /// Opens a cursor session against an output's `source`, and its image
+    /// sub-session.
     pub(super) fn open(
         cap_mgr: &ExtImageCopyCaptureManagerV1,
         source: &ExtImageCaptureSourceV1,
@@ -77,9 +73,8 @@ impl CursorCap {
     }
 }
 
-/// User-data marker distinguishing cursor capture sessions/frames from screen
-/// capture sessions/frames (both use the same `ExtImageCopyCaptureSessionV1` /
-/// `ExtImageCopyCaptureFrameV1` Wayland type).
+/// Userdata marking a session or frame as the cursor's rather than the screen's.
+/// Both use the same Wayland types, so the `Dispatch` impls need telling apart.
 struct CursorSessionUD(u32); // inner = wl_name
 
 impl ImageCopyCapture {
@@ -138,10 +133,10 @@ impl ImageCopyCapture {
                 return;
             };
             let pixel_count = (buf.width * buf.height) as usize;
-            // SAFETY: shm mapping, pixel_count * 4 == buf.size, 4-byte aligned.
+            // SAFETY: an shm mapping, 4-byte aligned, pixel_count * 4 == buf.size
             let raw = unsafe { std::slice::from_raw_parts(buf.map as *const u32, pixel_count) };
-            // Convert each captured pixel to X cursor ARGB (0xAARRGGBB). x-formats
-            // (no alpha) are forced opaque so the cursor isn't fully transparent.
+            // convert each pixel to X cursor ARGB (0xAARRGGBB), forcing the
+            // x-formats opaque so an alpha-less cursor isn't fully transparent
             let image: Vec<u32> = match cc.cap_format.and_then(pixel_layout) {
                 Some(([bi, gi, ri], ai)) => raw
                     .iter()
@@ -185,10 +180,9 @@ impl ImageCopyCapture {
         frame.destroy();
     }
 
-    /// Handles a cursor *pointer* event — where the cursor is, from the
-    /// `ext_image_copy_capture_cursor_session_v1` object (enter/leave/position/
-    /// hotspot). Distinct from the cursor *image* stream
-    /// ([`cursor_session_event`](Self::cursor_session_event)).
+    /// Handles a cursor *pointer* event — where the cursor is. Distinct from the
+    /// cursor *image* stream, which is
+    /// [`cursor_session_event`](Self::cursor_session_event).
     fn cursor_pointer_event(
         &mut self,
         wl_name: u32,
@@ -214,7 +208,7 @@ impl ImageCopyCapture {
                 }
             }
             Event::Position { x, y } => {
-                // Convert output-local hotspot position to virtual-screen coords.
+                // shift the output-local hotspot into virtual-screen coords
                 let root = self
                     .ctxs
                     .get(&wl_name)
@@ -239,8 +233,8 @@ impl ImageCopyCapture {
         }
     }
 
-    /// Handles a cursor *image* capture session event (buffer-size/format) — the
-    /// cursor-image parallel of [`screen_session_event`](ImageCopyCapture::screen_session_event).
+    /// Handles a cursor *image* session event, the cursor's counterpart to
+    /// [`screen_session_event`](ImageCopyCapture::screen_session_event).
     fn cursor_session_event(
         &mut self,
         wl_name: u32,
@@ -261,9 +255,9 @@ impl ImageCopyCapture {
                     && let Some(ctx) = self.ctxs.get_mut(&wl_name)
                     && let Some(cc) = ctx.cursor_cap.as_mut()
                 {
-                    // Prefer Argb8888 (zero-conversion + alpha); else a
-                    // convertible format with alpha (transparent cursors); else
-                    // any convertible; only then an unconvertible format.
+                    // prefer Argb8888, which needs no conversion and has alpha,
+                    // then anything convertible with alpha (transparent cursors),
+                    // then anything convertible, and only then the rest
                     let rank = |f: wl_shm::Format| -> u8 {
                         if f == wl_shm::Format::Argb8888 {
                             3
@@ -316,8 +310,8 @@ impl ImageCopyCapture {
         }
     }
 
-    /// Handles a cursor *image* capture frame event (the captured cursor image) —
-    /// the cursor-image parallel of [`screen_frame_event`](ImageCopyCapture::screen_frame_event).
+    /// Handles a cursor *image* frame event, the cursor's counterpart to
+    /// [`screen_frame_event`](ImageCopyCapture::screen_frame_event).
     fn cursor_frame_event(
         &mut self,
         wl_name: u32,

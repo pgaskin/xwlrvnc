@@ -1,5 +1,5 @@
-//! `zwlr-data-control-v1` backend: the [`DataControlManager`] impl and the
-//! device/offer/source `Dispatch` impls.
+//! `zwlr-data-control-v1` backend: the [`DataControlManager`] impl plus the
+//! device, offer and source `Dispatch` impls.
 
 use std::fs::File;
 use std::io::Write;

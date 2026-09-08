@@ -1,5 +1,5 @@
-//! `ext-data-control-v1` backend: the [`DataControlManager`] impl and the
-//! device/offer/source `Dispatch` impls.
+//! `ext-data-control-v1` backend: the [`DataControlManager`] impl plus the
+//! device, offer and source `Dispatch` impls.
 
 use std::io::Write;
 

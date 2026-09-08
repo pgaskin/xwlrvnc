@@ -1,11 +1,8 @@
-//! wl_shm-backed capture buffers and the pixel-format helpers used to convert
-//! captured frames into our native XRGB framebuffer.
-//!
-//! These are the leaf helpers shared by both capture backends: [`ShmBuffer`]
-//! wraps a memfd-backed `wl_buffer` the compositor copies into, and the
-//! `pixel_layout`/`channel_map`/`blit_channels` functions resolve the byte
-//! permutation needed to turn an arbitrary byte-ordered 8888 `wl_shm` format
-//! into the `[blue, green, red]` channel offsets [`crate::bridge::capture`] consumes.
+//! The leaf helpers both capture backends share: [`ShmBuffer`] wraps a
+//! memfd-backed `wl_buffer` for the compositor to copy into, and
+//! [`pixel_layout`] and friends resolve the byte permutation that turns an
+//! arbitrary byte-ordered 8888 `wl_shm` format into the `[blue, green, red]`
+//! offsets [`crate::bridge::capture`] wants.
 
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
@@ -26,8 +23,8 @@ pub(crate) struct ShmBuffer {
     pub format: wl_shm::Format,
 }
 
-// Only ever touched on the Wayland thread; the raw mapping pointer just needs to
-// ride along inside `State` (which the thread owns).
+// SAFETY: only ever touched on the Wayland thread, which owns the `State` the
+// raw mapping pointer rides along inside.
 unsafe impl Send for ShmBuffer {}
 
 impl Drop for ShmBuffer {
@@ -38,11 +35,10 @@ impl Drop for ShmBuffer {
     }
 }
 
-/// Byte offsets, within a little-endian 4-byte pixel, of the `[blue, green,
-/// red]` channels and (optionally) the alpha channel. Enough to convert any
-/// byte-ordered 8888 wl_shm format to/from our native layout; `None` for
-/// packed/float formats (10-bit etc.) that need bit unpacking, not a byte
-/// permutation. Offsets are the reverse of the DRM fourcc channel order.
+/// Byte offsets within a little-endian 4-byte pixel of the `[blue, green, red]`
+/// channels, plus alpha if the format has it — the reverse of the DRM fourcc
+/// channel order. `None` for packed or float formats (10-bit and such) that need
+/// bit unpacking rather than a byte permutation.
 pub(crate) fn pixel_layout(
     fmt: wl_shm::Format,
 ) -> Option<(crate::bridge::capture::ChannelMap, Option<usize>)> {
@@ -60,14 +56,13 @@ pub(crate) fn pixel_layout(
     })
 }
 
-/// The blit channel map (B,G,R source offsets) for converting a captured buffer
-/// in `fmt` into our XRGB framebuffer.
+/// Just the B,G,R source offsets, for blitting `fmt` into the framebuffer.
 pub(crate) fn channel_map(fmt: wl_shm::Format) -> Option<crate::bridge::capture::ChannelMap> {
     pixel_layout(fmt).map(|(bgr, _)| bgr)
 }
 
-/// Resolves the blit channel map for a buffer format, warning once-ish and
-/// falling back to the native order for formats we can't byte-permute.
+/// [`channel_map`], warning and falling back to the native order for a format
+/// we can't byte-permute.
 pub(crate) fn blit_channels(
     wl_name: u32,
     fmt: wl_shm::Format,
@@ -81,7 +76,7 @@ pub(crate) fn blit_channels(
     })
 }
 
-/// Creates a memfd-backed wl_shm buffer of the given geometry/format.
+/// Creates a memfd-backed wl_shm buffer of the given geometry and format.
 pub(crate) fn create_shm_buffer(
     shm: &wl_shm::WlShm,
     qh: &QueueHandle<State>,
@@ -94,9 +89,9 @@ pub(crate) fn create_shm_buffer(
     if size == 0 {
         return None;
     }
-    // SAFETY: standard memfd_create + ftruncate + mmap dance.
+    // SAFETY: the standard memfd_create + ftruncate + mmap dance
     let fd = unsafe {
-        let fd = nix::libc::memfd_create(c"wl-uinput-proxy-capture".as_ptr(), 0);
+        let fd = nix::libc::memfd_create(c"xwlrvnc-capture".as_ptr(), 0);
         if fd < 0 {
             return None;
         }

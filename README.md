@@ -123,7 +123,7 @@ I'll probably add support for other capture/input protocols later, and maybe als
 ### TODO
 
 - In progress
-  - Refactor everything and clean up Claude's mess (half done, just need to do the stuff under `src/bridge`)
+  - Refactor everything and clean up Claude's mess (almost done, just go over everything again)
 
 - Future
   - See if we can make input work on headless compositors with no existing seats.
