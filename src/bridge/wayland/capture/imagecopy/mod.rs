@@ -34,8 +34,11 @@ struct Ctx {
     x: i32,
     y: i32,
     buffer: Option<ShmBuffer>,
-    /// A capture is out, awaiting its `ready`/`failed`.
-    in_flight: bool,
+    /// The frame awaiting `ready`/`failed`. A session may only have one at a
+    /// time (a second `create_frame` is a `duplicate_frame` protocol error), so
+    /// this doubles as the in-flight guard and lets us tell our own frame's
+    /// events from a stray one's.
+    frame: Option<ExtImageCopyCaptureFrameV1>,
     /// Earliest the next capture may be requested.
     next_at: Instant,
     /// When the in-flight capture went out, for latency profiling.
@@ -140,7 +143,7 @@ impl ImageCopyCapture {
             let Some(ctx) = self.ctxs.get(&wl_name) else {
                 return;
             };
-            if ctx.in_flight {
+            if ctx.frame.is_some() {
                 return;
             }
             if ctx.session.is_none() {
@@ -185,7 +188,7 @@ impl ImageCopyCapture {
                     frame.attach_buffer(&buf.buffer);
                     frame.damage_buffer(0, 0, w as i32, h as i32);
                     frame.capture();
-                    ctx.in_flight = true;
+                    ctx.frame = Some(frame);
                     ctx.req_at = Some(Instant::now());
                     ctx.frame_damage.clear();
                 }
@@ -238,7 +241,7 @@ impl ImageCopyCapture {
         };
         let now = Instant::now();
         if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
-            ctx.in_flight = false;
+            ctx.frame = None;
             ctx.frame_damage.clear();
             let req_latency = ctx
                 .req_at
@@ -276,7 +279,7 @@ impl ImageCopyCapture {
         };
         crate::vlog!("ext capture frame failed ({reason_str}) for output {wl_name}");
         if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
-            ctx.in_flight = false;
+            ctx.frame = None;
             ctx.req_at = None;
             ctx.next_at = Instant::now() + SLOW_INTERVAL;
             // On buffer-constraints — the output resized, say — the session
@@ -352,13 +355,21 @@ impl ImageCopyCapture {
                     ctx.session_ready = false;
                     ctx.session_size = None;
                     ctx.session_format = None;
-                    ctx.in_flight = false;
+                    ctx.frame = None;
                     ctx.next_at = Instant::now() + SLOW_INTERVAL;
                 }
                 // tick -> start_capture_ext will recreate the session
             }
             _ => {}
         }
+    }
+
+    /// Whether `frame` is the one this output is currently waiting on.
+    fn is_current_frame(&self, wl_name: u32, frame: &ExtImageCopyCaptureFrameV1) -> bool {
+        self.ctxs
+            .get(&wl_name)
+            .and_then(|c| c.frame.as_ref())
+            .is_some_and(|f| f == frame)
     }
 
     /// Handles a screen frame event: the captured image, and its damage.
@@ -370,6 +381,17 @@ impl ImageCopyCapture {
         qh: &QueueHandle<State>,
     ) {
         use ext_frame_v1::Event;
+        // Only our own in-flight frame drives the state machine. Anything else is
+        // a frame the compositor rejected as a duplicate, or a leftover from a
+        // session we have already replaced; acting on it would clear `frame` and
+        // re-arm us into creating another duplicate, forever.
+        if !self.is_current_frame(wl_name, frame) {
+            if let Event::Ready | Event::Failed { .. } = event {
+                crate::vlog!("ignoring {event:?} for a stale capture frame on output {wl_name}");
+                frame.destroy();
+            }
+            return;
+        }
         match event {
             Event::Damage {
                 x,
@@ -415,7 +437,7 @@ impl CaptureBackend for ImageCopyCapture {
                     x,
                     y,
                     buffer: None,
-                    in_flight: false,
+                    frame: None,
                     next_at: now,
                     req_at: None,
                     source: None,
@@ -465,7 +487,7 @@ impl CaptureBackend for ImageCopyCapture {
         let due: Vec<u32> = self
             .ctxs
             .iter()
-            .filter(|(_, c)| !c.in_flight)
+            .filter(|(_, c)| c.frame.is_none())
             .filter_map(|(n, c)| {
                 if c.next_at <= now {
                     Some(*n)

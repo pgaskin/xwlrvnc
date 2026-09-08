@@ -35,7 +35,8 @@ pub(super) struct CursorCap {
     cap_size: Option<(u32, u32)>,
     cap_format: Option<wl_shm::Format>,
     buf: Option<ShmBuffer>,
-    in_flight: bool,
+    /// The frame awaiting `ready`/`failed`; see [`Ctx::frame`](super::Ctx).
+    frame: Option<ExtImageCopyCaptureFrameV1>,
     /// Whether the pointer is on this output right now.
     present: bool,
     /// Hotspot within the cursor image.
@@ -64,7 +65,7 @@ impl CursorCap {
             cap_size: None,
             cap_format: None,
             buf: None,
-            in_flight: false,
+            frame: None,
             present: false,
             hotspot: (0, 0),
             pos: None,
@@ -84,7 +85,7 @@ impl ImageCopyCapture {
                 return;
             };
             let Some(cc) = &ctx.cursor_cap else { return };
-            if cc.in_flight || !cc.present || !cc.cap_ready {
+            if cc.frame.is_some() || !cc.present || !cc.cap_ready {
                 return;
             }
             match (cc.cap_session.clone(), cc.cap_size, cc.cap_format) {
@@ -108,7 +109,7 @@ impl ImageCopyCapture {
             frame.attach_buffer(&buf.buffer);
             frame.damage_buffer(0, 0, w as i32, h as i32);
             frame.capture();
-            cc.in_flight = true;
+            cc.frame = Some(frame);
             cc.frame_damage.clear();
         }
     }
@@ -160,7 +161,7 @@ impl ImageCopyCapture {
         if let Some(ctx) = self.ctxs.get_mut(&wl_name)
             && let Some(cc) = ctx.cursor_cap.as_mut()
         {
-            cc.in_flight = false;
+            cc.frame = None;
             cc.frame_damage.clear();
         }
         frame.destroy();
@@ -172,7 +173,7 @@ impl ImageCopyCapture {
         if let Some(ctx) = self.ctxs.get_mut(&wl_name)
             && let Some(cc) = ctx.cursor_cap.as_mut()
         {
-            cc.in_flight = false;
+            cc.frame = None;
             cc.cap_ready = false;
             cc.cap_size = None;
             cc.cap_format = None;
@@ -303,7 +304,7 @@ impl ImageCopyCapture {
                     cc.cap_ready = false;
                     cc.cap_size = None;
                     cc.cap_format = None;
-                    cc.in_flight = false;
+                    cc.frame = None;
                 }
             }
             _ => {}
@@ -320,6 +321,21 @@ impl ImageCopyCapture {
         qh: &QueueHandle<State>,
     ) {
         use ext_frame_v1::Event;
+        // Same rule as the screen path: only our own in-flight frame counts, or a
+        // rejected duplicate re-arms us into producing another one.
+        let current = self
+            .ctxs
+            .get(&wl_name)
+            .and_then(|c| c.cursor_cap.as_ref())
+            .and_then(|cc| cc.frame.as_ref())
+            .is_some_and(|f| f == frame);
+        if !current {
+            if let Event::Ready | Event::Failed { .. } = event {
+                crate::vlog!("ignoring {event:?} for a stale cursor frame on output {wl_name}");
+                frame.destroy();
+            }
+            return;
+        }
         match event {
             Event::Damage {
                 x,
