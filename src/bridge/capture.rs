@@ -186,11 +186,18 @@ impl Framebuffer {
     /// the framebuffer and nothing else.
     pub fn read_rect_into(&self, x: i32, y: i32, width: u32, height: u32, dst: &mut [u8]) {
         self.last_read_ms.store(now_ms(), Ordering::Relaxed);
+        let row_bytes = width as usize * 4;
+        // A zero-width rect has no rows at all. X answers such a request with an
+        // ordinary reply carrying an empty image rather than an error (checked
+        // against Xorg), and the row count below would divide by zero.
+        if row_bytes == 0 {
+            dst.fill(0);
+            return;
+        }
         let t0 = Instant::now();
         let fb = self.inner.lock().unwrap();
         let wait_ns = t0.elapsed().as_nanos() as u64;
         let t1 = Instant::now();
-        let row_bytes = width as usize * 4;
         let stride = fb.width as usize * 4;
         // horizontal overlap of the requested rect with the framebuffer
         let sx0 = x.max(0);
