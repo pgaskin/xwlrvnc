@@ -2,11 +2,13 @@
 
 Fake X server backed by a Wayland display, implementing just enough for RealVNC to work on it.
 
+It also happens to work with x11vnc and a few other remote desktop and screen capture tools.
+
 The initial version was mostly vibe-coded, but designed and tested by me. This README and all the documentation was entirely hand-written. See [here](./docs/vibe-coding.md) for my thoughts on vibe-coding.
 
 Also see [vncagent-wlr-fixes](https://github.com/pgaskin/vncagent-wlr-fixes) for an alternative approach I tried to fix RealVNC's experimental Wayland support instead.
 
-You may also be interested in my [fixes and patches](https://github.com/pgaskin/vncpatch) for the RealVNC Android app, including an invisible menu (instead of the gigantic floating toolbar which gets in the way), dark mode support, key repeat support, and a fix for clicks randomly not working on high-frequency touchscreens (e.g., on a Pixel 9 or later).
+You may also be interested in my [remote desktop app](https://pgaskin.net/vento/) for the Android, which includes multiple client implementations (LibVNC, TigerVNC, RealVNC, FreeRDP, IronRDP, SPICE, and RustDesk) and has the nicest touch controls of all current alternatives.
 
 ### Usage
 
