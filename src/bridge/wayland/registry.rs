@@ -76,7 +76,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     if config.seat.is_none() {
                         // no -seat, so take the first one we see
                         if state.seat.is_none() {
-                            state.select_seat(seat, conn, qh);
+                            state.select_seat(name, seat, conn, qh);
                         }
                     } else {
                         // wait for the seat's `name` event to match -seat NAME

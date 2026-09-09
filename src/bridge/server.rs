@@ -6,6 +6,7 @@ use crate::bridge::cursor::CursorState;
 use crate::bridge::damage::DamageSink;
 use crate::bridge::event::EventSink;
 use crate::bridge::input::Input;
+use crate::bridge::keymap::KeyTable;
 use crate::bridge::x11::randr::Screen;
 use crate::config::Config;
 use crate::util::Geometry;
@@ -20,8 +21,9 @@ pub(crate) struct Server {
     pub framebuffer: Arc<Framebuffer>,
     pub damage: DamageSink,
     pub cursor: CursorState,
-    /// X keysym table built from the compositor keymap (`None` until received).
-    pub keymap: Mutex<Option<Vec<u32>>>,
+    /// X keysym and modifier tables built from the compositor keymap (`None`
+    /// until received).
+    pub keymap: Mutex<Option<KeyTable>>,
 }
 
 impl Server {

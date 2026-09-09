@@ -20,9 +20,11 @@ struct Ctx {
     output: wl_output::WlOutput,
     x: i32,
     y: i32,
+    /// The capture that is out, awaiting its `ready`/`failed`. Declared before
+    /// `buffer` so a dropped context cancels the copy before destroying the
+    /// buffer it copies into.
+    frame: Option<ZwlrScreencopyFrameV1>,
     buffer: Option<ShmBuffer>,
-    /// A capture is out, awaiting its `ready`/`failed`.
-    in_flight: bool,
     /// Earliest the next capture may be requested.
     next_at: Instant,
     /// When the in-flight capture went out, for latency profiling.
@@ -34,6 +36,17 @@ struct Ctx {
     interval: Duration,
     /// `Framebuffer::last_read_ms` at the previous blit, for no-damage pacing.
     last_read_seen: u64,
+}
+
+impl Drop for Ctx {
+    fn drop(&mut self) {
+        // The backend can be replaced (by ext) or an output removed with a
+        // capture in flight; dropping the proxy alone would leave the frame
+        // alive in the compositor, and its events unanswered.
+        if let Some(frame) = self.frame.take() {
+            frame.destroy();
+        }
+    }
 }
 
 pub(crate) struct ScreencopyCapture {
@@ -64,8 +77,7 @@ impl ScreencopyCapture {
         // overlay_cursor = 1 renders the cursor into the image so the remote can
         // see it; we then report a transparent XFixes cursor so the agent doesn't
         // draw a second one on top
-        self.mgr.capture_output(1, &ctx.output, qh, wl_name);
-        ctx.in_flight = true;
+        ctx.frame = Some(self.mgr.capture_output(1, &ctx.output, qh, wl_name));
         ctx.req_at = Some(Instant::now());
     }
 
@@ -123,7 +135,7 @@ impl ScreencopyCapture {
         let fast = fast_interval(&self.server);
         let now = Instant::now();
         if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
-            ctx.in_flight = false;
+            ctx.frame = None;
             let req_latency = ctx
                 .req_at
                 .take()
@@ -167,7 +179,7 @@ impl ScreencopyCapture {
     ) {
         crate::warning!("capture failed for output {wl_name}");
         if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
-            ctx.in_flight = false;
+            ctx.frame = None;
             ctx.req_at = None;
             ctx.next_at = Instant::now() + SLOW_INTERVAL; // back off, then retry
         }
@@ -183,6 +195,21 @@ impl ScreencopyCapture {
         qh: &QueueHandle<State>,
     ) {
         use zwlr_screencopy_frame_v1::Event;
+        // Only the frame this output is waiting on drives its state; anything
+        // else is a leftover from a replaced context, which is only ever
+        // destroyed here if it was not already.
+        let current = self
+            .ctxs
+            .get(&wl_name)
+            .and_then(|c| c.frame.as_ref())
+            .is_some_and(|f| f == frame);
+        if !current {
+            if let Event::Ready { .. } | Event::Failed = event {
+                crate::vlog!("ignoring {event:?} for a stale capture frame on output {wl_name}");
+                frame.destroy();
+            }
+            return;
+        }
         match event {
             Event::Buffer {
                 format,
@@ -243,8 +270,8 @@ impl CaptureBackend for ScreencopyCapture {
                     output,
                     x,
                     y,
+                    frame: None,
                     buffer: None,
-                    in_flight: false,
                     next_at: now,
                     req_at: None,
                     pending: None,
@@ -280,7 +307,7 @@ impl CaptureBackend for ScreencopyCapture {
         let due: Vec<u32> = self
             .ctxs
             .iter()
-            .filter(|(_, c)| !c.in_flight)
+            .filter(|(_, c)| c.frame.is_none())
             .filter_map(|(n, c)| {
                 if c.next_at <= now {
                     Some(*n)

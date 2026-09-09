@@ -51,6 +51,10 @@ pub struct Output {
 pub struct Mode {
     pub info: ModeInfo,
     pub name: Vec<u8>,
+    /// Allocated by us for an output's native resolution, and so freed once no
+    /// output lists it; a client-created mode (`RandrCreateMode`) is the
+    /// client's to destroy.
+    ours: bool,
 }
 
 impl Screen {
@@ -106,8 +110,21 @@ impl Screen {
         let id = self.alloc_id();
         info.id = id;
         info.name_len = name.len() as u16;
-        self.modes.push(Mode { info, name });
+        self.modes.push(Mode {
+            info,
+            name,
+            ours: false,
+        });
         id
+    }
+
+    /// Drops the native modes no output lists any more, after an output's mode
+    /// changed or the output went away; without this every resolution change
+    /// leaves a mode behind forever.
+    fn prune_modes(&mut self) {
+        let outputs = &self.outputs;
+        self.modes
+            .retain(|m| !m.ours || outputs.iter().any(|o| o.mode_ids.contains(&m.info.id)));
     }
 
     pub fn add_output_mode(&mut self, output: u32, mode: u32) {
@@ -320,6 +337,7 @@ impl Screen {
                     self.alloc_mode(width, height, refresh_mhz)
                 };
                 let o = &mut self.outputs[i];
+                let old = o.mode;
                 o.lx = lx;
                 o.ly = ly;
                 o.lw = lw;
@@ -329,6 +347,11 @@ impl Screen {
                 o.mode = mode;
                 if !o.mode_ids.contains(&mode) {
                     o.mode_ids.push(mode);
+                }
+                // the previous native mode is ours to retire
+                if old != mode && self.modes.iter().any(|m| m.info.id == old && m.ours) {
+                    self.outputs[i].mode_ids.retain(|&m| m != old);
+                    self.prune_modes();
                 }
             }
             None => {
@@ -358,18 +381,9 @@ impl Screen {
                     wl_name,
                     connected: true,
                 });
-                // drop the fake output now that we have a real one
-                let orphans: Vec<u32> = self
-                    .outputs
-                    .iter()
-                    .filter(|o| !o.is_wayland())
-                    .flat_map(|o| o.mode_ids.iter().copied())
-                    .collect();
+                // drop the fake output, and its mode, now that we have a real one
                 self.outputs.retain(|o| o.is_wayland());
-                self.modes.retain(|m| {
-                    !orphans.contains(&m.info.id)
-                        || self.outputs.iter().any(|o| o.mode_ids.contains(&m.info.id))
-                });
+                self.prune_modes();
             }
         }
         self.relayout_physical();
@@ -381,6 +395,7 @@ impl Screen {
         let before = self.outputs.len();
         self.outputs.retain(|o| o.wl_name != wl_name);
         if self.outputs.len() != before {
+            self.prune_modes();
             self.relayout_physical();
             self.recompute_bounds();
             true
@@ -421,7 +436,11 @@ impl Mode {
             name_len: name.len() as u16,
             mode_flags: ModeFlag::from(0u32),
         };
-        Self { info, name }
+        Self {
+            info,
+            name,
+            ours: true,
+        }
     }
 }
 

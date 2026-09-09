@@ -91,10 +91,11 @@ impl Capture {
             .unwrap_or_default()
     }
 
-    /// Records the seat pointer so the ext backend can open cursor sessions.
-    pub(super) fn set_pointer(&mut self, pointer: wl_pointer::WlPointer) {
+    /// Records the seat pointer so the ext backend can open cursor sessions,
+    /// including for outputs whose screen session already exists.
+    pub(super) fn set_pointer(&mut self, pointer: wl_pointer::WlPointer, qh: &QueueHandle<State>) {
         if let Capture::ImageCopy(c) = self {
-            c.set_pointer(pointer);
+            c.set_pointer(pointer, qh);
         }
     }
 }
@@ -129,10 +130,16 @@ fn fast_interval(server: &Server) -> Duration {
 }
 
 impl State {
-    /// Ensures a backend exists, preferring ext once shm and a capture protocol
-    /// are both bound, and a context per output. The requests themselves are
-    /// issued, paced, by [`tick_captures`](Self::tick_captures).
+    /// Ensures the preferred backend exists, and a context per output: ext once
+    /// shm and both its managers are bound, else screencopy, and a screencopy
+    /// backend is replaced if the ext managers turn up later. Nothing is chosen
+    /// until the initial registry burst has settled, so the usual case picks
+    /// once with every global known. The requests themselves are issued, paced,
+    /// by [`tick_captures`](Self::tick_captures).
     pub(super) fn maybe_start_captures(&mut self, qh: &QueueHandle<Self>) {
+        if !self.registry_settled {
+            return;
+        }
         let has_wlr = self.shm.is_some() && self.screencopy.is_some();
         let has_ext =
             self.shm.is_some() && self.ext_source_mgr.is_some() && self.ext_capture_mgr.is_some();

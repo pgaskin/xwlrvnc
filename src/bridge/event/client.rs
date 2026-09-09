@@ -1,9 +1,18 @@
 use std::io::Write;
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::time::Duration;
 
 use crate::bridge::clipboard::Sel;
+
+/// How long a write may block before the client is given up on. Events are
+/// pushed from the Wayland thread, so a client that stops reading (stopped, or
+/// wedged) with a full socket buffer would otherwise stall screen capture and
+/// the clipboard for every other client too. An X server buffers per client
+/// instead; this is the cheap approximation.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The socket plus the last 16-bit sequence written to it.
 ///
@@ -53,6 +62,9 @@ pub struct Client {
 
 impl Client {
     pub fn new(writer: UnixStream) -> Self {
+        // the option is on the socket, so the connection thread's reads on its
+        // duplicate fd are unaffected
+        let _ = writer.set_write_timeout(Some(WRITE_TIMEOUT));
         Self {
             writer: Mutex::new(SeqWriter {
                 stream: writer,
@@ -83,13 +95,20 @@ impl Client {
     }
 
     /// Writes a server-initiated event, stamping the client's current request
-    /// sequence under the writer lock so it can't race a concurrent reply.
+    /// sequence under the writer lock so it can't race a concurrent reply. A
+    /// failed write (the client went away, or timed out) drops the client: it
+    /// is marked dead and its socket shut down, so the connection thread's next
+    /// read ends and it cleans up.
     pub fn send_event_bytes(&self, buf: &mut [u8]) {
         let mut w = self.writer.lock().unwrap();
         let seq = w.monotonic(self.seq.load(Ordering::Relaxed));
         buf[2..4].copy_from_slice(&seq.to_le_bytes());
         w.last_seq = seq;
-        let _ = w.stream.write_all(buf);
+        if let Err(e) = w.stream.write_all(buf) {
+            crate::vlog!("dropping client: event write failed: {e}");
+            self.mark_dead();
+            let _ = w.stream.shutdown(Shutdown::Both);
+        }
     }
 
     pub fn set_seq(&self, seq: u16) {

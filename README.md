@@ -62,7 +62,7 @@ The core VNC features, plus some RealVNC extensions work correctly and have been
     - Additional encryption methods.
     - Additional encodings.
     - File transfer.
-  - Dynamic resolution (if enabled, needs a [hook](./dynres/)).
+  - TODO: Dynamic resolution (if enabled, needs a [hook](./dynres/)).
 - Performance:
   - Adaptive capture rate for reduced CPU usage.
   - No capture while idle.

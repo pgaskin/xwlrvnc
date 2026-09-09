@@ -58,6 +58,23 @@ struct Ctx {
     cursor_cap: Option<CursorCap>,
 }
 
+impl Drop for Ctx {
+    fn drop(&mut self) {
+        // Dropping the proxies does not destroy the objects; without this an
+        // output removal (or a replaced backend) leaves the session running in
+        // the compositor. Frame first, since it belongs to the session.
+        if let Some(frame) = self.frame.take() {
+            frame.destroy();
+        }
+        if let Some(session) = self.session.take() {
+            session.destroy();
+        }
+        if let Some(source) = self.source.take() {
+            source.destroy();
+        }
+    }
+}
+
 pub(crate) struct ImageCopyCapture {
     server: Arc<Server>,
     shm: wl_shm::WlShm,
@@ -86,8 +103,31 @@ impl ImageCopyCapture {
         }
     }
 
-    pub(super) fn set_pointer(&mut self, pointer: wl_pointer::WlPointer) {
+    /// Records the seat pointer, and opens a cursor session for every output
+    /// whose screen session was created before the pointer was known (the seat
+    /// can arrive after the capture managers and outputs, and with `-seat NAME`
+    /// it always does).
+    pub(super) fn set_pointer(&mut self, pointer: wl_pointer::WlPointer, qh: &QueueHandle<State>) {
         self.pointer = Some(pointer);
+        if self.bake_cursor() {
+            return;
+        }
+        let cap_mgr = self.cap_mgr.clone();
+        let Some(ptr) = &self.pointer else { return };
+        for (&wl_name, ctx) in self.ctxs.iter_mut() {
+            if ctx.cursor_cap.is_none()
+                && let Some(source) = &ctx.source
+            {
+                ctx.cursor_cap = Some(CursorCap::open(&cap_mgr, source, ptr, qh, wl_name));
+            }
+        }
+    }
+
+    /// Whether `-cursor none` composites the cursor into the screen frames (with
+    /// a transparent XFixes cursor so the agent doesn't draw a second one),
+    /// rather than capturing it separately and sending it over XFixes.
+    fn bake_cursor(&self) -> bool {
+        self.server.config.cursor == crate::config::CursorType::Baked
     }
 
     fn create_ext_session(&mut self, wl_name: u32, qh: &QueueHandle<State>) {
@@ -97,10 +137,7 @@ impl ImageCopyCapture {
             return;
         };
         let source = source_mgr.create_source(&output, qh, ());
-        // `-cursor none` composites the cursor into the screen frames, and we
-        // then report a transparent XFixes cursor so the agent doesn't draw a
-        // second one; otherwise it is captured separately and sent over XFixes
-        let bake = self.server.config.cursor == crate::config::CursorType::Baked;
+        let bake = self.bake_cursor();
         let options = if bake {
             CaptureOptions::PaintCursors
         } else {
@@ -117,8 +154,14 @@ impl ImageCopyCapture {
             .map(|ptr| CursorCap::open(&cap_mgr, &source, ptr, qh, wl_name));
 
         if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
-            ctx.source = Some(source);
-            ctx.session = Some(session);
+            // a restart after `stopped` replaces the source and session; the old
+            // cursor session goes with its `CursorCap` drop below
+            if let Some(old) = ctx.session.replace(session) {
+                old.destroy();
+            }
+            if let Some(old) = ctx.source.replace(source) {
+                old.destroy();
+            }
             ctx.session_ready = false;
             ctx.session_size = None;
             ctx.session_format = None;
@@ -338,7 +381,8 @@ impl ImageCopyCapture {
                 if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
                     let Some(fmt) = ctx.session_format else {
                         crate::warning!(
-                            "ext session for output {wl_name} offered no shm format; skipping"
+                            "ext session for output {wl_name} offered no shm format; \
+                             skipping (try -screen screencopy)"
                         );
                         return;
                     };
@@ -351,11 +395,17 @@ impl ImageCopyCapture {
             Event::Stopped => {
                 crate::vlog!("ext capture session stopped for output {wl_name}; will restart");
                 if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
-                    ctx.session = None;
+                    // a stopped session is dead, and the protocol expects us to
+                    // destroy it (and any frame on it) rather than leave it
+                    if let Some(frame) = ctx.frame.take() {
+                        frame.destroy();
+                    }
+                    if let Some(session) = ctx.session.take() {
+                        session.destroy();
+                    }
                     ctx.session_ready = false;
                     ctx.session_size = None;
                     ctx.session_format = None;
-                    ctx.frame = None;
                     ctx.next_at = Instant::now() + SLOW_INTERVAL;
                 }
                 // tick -> start_capture_ext will recreate the session

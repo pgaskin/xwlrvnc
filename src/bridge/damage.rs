@@ -114,7 +114,8 @@ impl DamageSink {
         for o in objs.iter_mut() {
             match o.level {
                 RAW => {
-                    o.region.extend_from_slice(&new);
+                    // nothing accumulates: subtract is a no-op at this level, so
+                    // a region here would only ever grow (x11vnc uses RAW)
                     notify(o, &new, geom);
                 }
                 DELTA => {

@@ -7,14 +7,6 @@ mod util;
 use core::fmt::Write as _;
 use util::*;
 
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {
-        core::hint::spin_loop()
-    }
-}
-
 #[used]
 #[link_section = ".init_array"]
 static CTOR: unsafe extern "C" fn() = {
@@ -35,7 +27,34 @@ macro_rules! log {
     }};
 }
 
-const MAX_READ_BYTES: usize = 24280; // for environ and maps
+/// A panic in a preloaded constructor has nowhere to unwind to; say what
+/// happened and trap, since hanging the host process silently is worse than
+/// crashing it.
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // just the location: formatting the message drags in unwinding support
+    // that a no_std cdylib cannot link
+    match info.location() {
+        Some(loc) => log!("panic at {}:{}", loc.file(), loc.line()),
+        None => log!("panic"),
+    }
+    util::trap()
+}
+
+/// Referenced by the precompiled `core` this links against, which is built
+/// for unwinding; with `panic = "abort"` it is never called. Without a
+/// definition the hook fails to load at all (`undefined symbol:
+/// rust_eh_personality`).
+#[cfg(not(test))]
+#[unsafe(no_mangle)]
+extern "C" fn rust_eh_personality() {}
+
+/// Buffer for `/proc/self/environ` and `/proc/self/maps`. A process with many
+/// libraries has a maps file well past 24 KiB, and a truncated read silently
+/// hides mappings (and so the RTTI we look for), so this is generous and a
+/// short read is reported.
+const MAX_READ_BYTES: usize = 128 * 1024;
 const MAX_MAPS_ENTRIES: usize = 1024;
 const MAX_VTABLE_SLOTS: usize = 16;
 const FN_SCAN_LIMIT: usize = 64;
@@ -54,6 +73,9 @@ unsafe fn patch() {
                 return;
             }
         };
+        if env.truncated {
+            log!("warning: /proc/self/environ is larger than {MAX_READ_BYTES} bytes; truncated");
+        }
         if !parse_bool(env.get(b"FORCE_DYNRES").unwrap_or(b"0")).unwrap_or(false) {
             return;
         }
@@ -68,6 +90,11 @@ unsafe fn patch() {
             return;
         }
     };
+    if maps.truncated {
+        log!(
+            "warning: /proc/self/maps has more than {MAX_READ_BYTES} bytes or {MAX_MAPS_ENTRIES} entries; some mappings are not scanned"
+        );
+    }
     if maps.is_empty() {
         return;
     }

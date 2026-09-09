@@ -130,22 +130,25 @@ impl EventSink {
         });
     }
 
-    /// MappingNotify(Keyboard) to every client, so they re-read the mapping via
-    /// `XRefreshKeyboardMapping`. Without it a compositor layout switch leaves
-    /// clients with a stale keycode->keysym table, typing the wrong characters.
-    /// MappingNotify is unmaskable, hence every client rather than a selection.
+    /// MappingNotify(Keyboard) and MappingNotify(Modifier) to every client, so
+    /// they re-read both tables via `XRefreshKeyboardMapping`. Without it a
+    /// compositor layout switch leaves clients with a stale keycode->keysym
+    /// table, typing the wrong characters. MappingNotify is unmaskable, hence
+    /// every client rather than a selection.
     pub fn keyboard_mapping_changed(&self, first_keycode: u8, count: u8) {
         self.each_live(|c| {
-            send(
-                c,
-                &xproto::MappingNotifyEvent {
-                    response_type: xproto::MAPPING_NOTIFY_EVENT,
-                    sequence: c.seq(),
-                    request: xproto::Mapping::KEYBOARD,
-                    first_keycode,
-                    count,
-                },
-            );
+            for request in [xproto::Mapping::KEYBOARD, xproto::Mapping::MODIFIER] {
+                send(
+                    c,
+                    &xproto::MappingNotifyEvent {
+                        response_type: xproto::MAPPING_NOTIFY_EVENT,
+                        sequence: c.seq(),
+                        request,
+                        first_keycode,
+                        count,
+                    },
+                );
+            }
         });
     }
 }

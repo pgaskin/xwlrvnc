@@ -68,6 +68,7 @@ pub fn spawn(server: Arc<Server>) {
         xdg_output_mgr: None,
         seat: None,
         pending_seats: HashMap::new(),
+        seat_caps: HashMap::new(),
         keyboard: None,
         pointer: None,
         ext_manager: None,
@@ -80,6 +81,7 @@ pub fn spawn(server: Arc<Server>) {
         ext_source_mgr: None,
         ext_capture_mgr: None,
         capture: Capture::None,
+        registry_settled: false,
         pointer_backend: None,
         keyboard_backend: None,
         virtual_input_ready: false,
@@ -89,11 +91,17 @@ pub fn spawn(server: Arc<Server>) {
     };
 
     // settle the registry globals, and the events they trigger, before the
-    // caller spawns the wrapped binary
-    for _ in 0..3 {
+    // caller spawns the wrapped binary; the first roundtrip delivers every
+    // initial global, so the capture backend is chosen after it with all of
+    // them known rather than swapped as they arrive
+    for i in 0..3 {
         if let Err(e) = queue.roundtrip(&mut state) {
             crate::warning!("wayland setup failed: {e}; using default geometry");
             return;
+        }
+        if i == 0 {
+            state.registry_settled = true;
+            state.maybe_start_captures(&qh);
         }
     }
 
@@ -165,6 +173,10 @@ struct State {
     /// Seats bound but not chosen, held alive for their `name` event while we
     /// wait to match `-seat NAME`. Keyed by registry name.
     pending_seats: HashMap<u32, wl_seat::WlSeat>,
+    /// The last `capabilities` from every bound seat, keyed by registry name.
+    /// Kept for the ones not yet chosen, since the event may land before the
+    /// `name` that selects the seat.
+    seat_caps: HashMap<u32, wl_seat::Capability>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>, // passive, only for cursor sessions
     ext_manager: Option<ExtDataControlManagerV1>, // clipboard, preferred
@@ -178,8 +190,9 @@ struct State {
     screencopy: Option<ZwlrScreencopyManagerV1>, // capture, fallback
     ext_source_mgr: Option<ExtOutputImageCaptureSourceManagerV1>, // capture, preferred
     ext_capture_mgr: Option<ExtImageCopyCaptureManagerV1>,
-    capture: Capture,     // whichever of the two won
-    capture_active: bool, // as of the last tick, for start/stop logging
+    capture: Capture,       // the one in use; ext supersedes screencopy
+    registry_settled: bool, // the initial globals have all arrived
+    capture_active: bool,   // as of the last tick, for start/stop logging
     /// Backends that mint the virtual pointer/keyboard once a seat exists.
     pointer_backend: Option<Box<dyn PointerBackend>>,
     keyboard_backend: Option<Box<dyn KeyboardBackend>>,
@@ -196,41 +209,77 @@ struct State {
 }
 
 impl State {
-    /// Commits to a seat, creating its passive keyboard (for the keymap) and
-    /// pointer (for cursor sessions), then wiring up clipboard and virtual
-    /// input. Any other pending seats are dropped.
-    fn select_seat(&mut self, seat: wl_seat::WlSeat, conn: &Connection, qh: &QueueHandle<Self>) {
-        self.keyboard = Some(seat.get_keyboard(qh, ()));
-        let pointer = seat.get_pointer(qh, ());
-        // the ext backend opens cursor sessions against the seat pointer, so hand
-        // it over now in case that backend was built first
-        self.capture.set_pointer(pointer.clone());
-        self.pointer = Some(pointer);
+    /// Commits to a seat, wiring up clipboard and virtual input, and creating
+    /// its passive keyboard (for the keymap) and pointer (for cursor sessions)
+    /// for whatever capabilities it has announced so far. Any other pending
+    /// seats are dropped.
+    fn select_seat(
+        &mut self,
+        name: u32,
+        seat: wl_seat::WlSeat,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
         self.seat = Some(seat);
         self.pending_seats.clear();
         self.try_init_device(conn, qh);
         self.try_init_virtual_input(conn, qh);
+        if let Some(caps) = self.seat_caps.get(&name).copied() {
+            self.sync_seat_devices(caps, qh);
+        }
+    }
+
+    /// Creates the passive keyboard and pointer on the chosen seat once it has
+    /// the matching capability. Asking before then is a protocol error
+    /// (`missing_capability`), which would kill the whole connection; a headless
+    /// compositor with no input devices only gains the capabilities once our
+    /// virtual devices exist. Each is created once and kept across capability
+    /// changes.
+    fn sync_seat_devices(&mut self, caps: wl_seat::Capability, qh: &QueueHandle<Self>) {
+        let Some(seat) = &self.seat else { return };
+        if caps.contains(wl_seat::Capability::Keyboard) && self.keyboard.is_none() {
+            self.keyboard = Some(seat.get_keyboard(qh, ()));
+        }
+        if caps.contains(wl_seat::Capability::Pointer) && self.pointer.is_none() {
+            let pointer = seat.get_pointer(qh, ());
+            // the ext backend opens cursor sessions against the seat pointer, so
+            // hand it over in case that backend was built first
+            self.capture.set_pointer(pointer.clone(), qh);
+            self.pointer = Some(pointer);
+        }
     }
 }
 
 impl Dispatch<wl_seat::WlSeat, u32> for State {
     fn event(
         state: &mut Self,
-        _seat: &wl_seat::WlSeat,
+        seat: &wl_seat::WlSeat,
         event: wl_seat::Event,
         &name: &u32,
         conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        // only the name matters, for matching -seat NAME; once a seat is chosen
-        // the rest are dropped and this no-ops
-        if let wl_seat::Event::Name { name: seat_name } = event
-            && state.seat.is_none()
-            && state.server.config.seat.as_deref() == Some(seat_name.as_str())
-            && let Some(seat) = state.pending_seats.remove(&name)
-        {
-            crate::log!("using wayland seat {seat_name:?}");
-            state.select_seat(seat, conn, qh);
+        match event {
+            wl_seat::Event::Capabilities {
+                capabilities: WEnum::Value(caps),
+            } => {
+                state.seat_caps.insert(name, caps);
+                if state.seat.as_ref() == Some(seat) {
+                    state.sync_seat_devices(caps, qh);
+                }
+            }
+            // the name matters for matching -seat NAME; once a seat is chosen
+            // the rest are dropped and this no-ops
+            wl_seat::Event::Name { name: seat_name }
+                if state.seat.is_none()
+                    && state.server.config.seat.as_deref() == Some(seat_name.as_str()) =>
+            {
+                if let Some(seat) = state.pending_seats.remove(&name) {
+                    crate::log!("using wayland seat {seat_name:?}");
+                    state.select_seat(name, seat, conn, qh);
+                }
+            }
+            _ => {}
         }
     }
 }

@@ -26,6 +26,11 @@ use crate::bridge::x11::ext::EXTENSIONS;
 use crate::bridge::x11::{CLIENT_RESOURCE_ID_BASE, SELECTION_FETCH_WINDOW};
 use crate::util::{Geometry, bbox, mm};
 
+/// The largest request we accept, in 4-byte units including the header, as
+/// advertised by `BigreqEnable`. Anything bigger is a broken or hostile
+/// client, and is disconnected rather than allocated for.
+const MAX_REQUEST_LENGTH: u32 = 4_194_303;
+
 pub struct Connection {
     reader: BufReader<UnixStream>,
     client: Arc<Client>,
@@ -111,8 +116,10 @@ impl Connection {
         let req = match Request::parse(header, &raw.body, &mut fds, &EXTENSIONS) {
             Ok(req) => req,
             Err(e) => {
+                // BadLength is what a real server answers a malformed request
+                // with; without some reply a client waiting on one hangs forever
                 crate::warning!("failed to parse request {major}.{minor}: {e:?}");
-                return Ok(());
+                return self.send_error(xproto::LENGTH_ERROR, major, u16::from(minor));
             }
         };
 
@@ -198,15 +205,29 @@ impl Connection {
                     }
                     return Ok(());
                 }
-                self.properties.set(
-                    r.window,
-                    r.property,
-                    Property {
-                        type_: r.type_,
-                        format: r.format,
-                        data: r.data.into_owned(),
-                    },
-                );
+                let mut value = Property {
+                    type_: r.type_,
+                    format: r.format,
+                    data: r.data.into_owned(),
+                };
+                // Prepend/Append extend an existing value, which must agree on
+                // type and format (BadMatch otherwise); on a missing property
+                // they behave as Replace.
+                if r.mode != xproto::PropMode::REPLACE
+                    && let Some(old) = self.properties.get(r.window, r.property)
+                {
+                    if old.type_ != value.type_ || old.format != value.format {
+                        return self.send_error(xproto::MATCH_ERROR, major, u16::from(minor));
+                    }
+                    if r.mode == xproto::PropMode::APPEND {
+                        let mut data = old.data.clone();
+                        data.append(&mut value.data);
+                        value.data = data;
+                    } else {
+                        value.data.extend_from_slice(&old.data);
+                    }
+                }
+                self.properties.set(r.window, r.property, value);
                 self.property_notify(r.window, r.property, xproto::Property::NEW_VALUE);
             }
             Request::DeleteProperty(r) => {
@@ -214,8 +235,11 @@ impl Connection {
                 self.property_notify(r.window, r.property, xproto::Property::DELETE);
             }
             Request::GetProperty(r) => {
-                let reply = self.get_property(&r);
+                let (reply, deleted) = self.get_property(&r);
                 self.reply(&reply)?;
+                if deleted {
+                    self.property_notify(r.window, r.property, xproto::Property::DELETE);
+                }
             }
             Request::ListProperties(r) => {
                 let atoms = self.properties.list(r.window);
@@ -338,7 +362,7 @@ impl Connection {
                 let (per, keysyms) = match self.server.keymap.lock().unwrap().as_ref() {
                     Some(table) => (
                         crate::bridge::keymap::SYMS_PER,
-                        crate::bridge::keymap::mapping_slice(table, r.first_keycode, r.count),
+                        crate::bridge::keymap::mapping_slice(&table.syms, r.first_keycode, r.count),
                     ),
                     // No compositor keymap yet: report one NoSymbol per keycode.
                     None => (1u8, vec![0u32; r.count as usize]),
@@ -350,10 +374,17 @@ impl Connection {
                 })?;
             }
             Request::GetModifierMapping(_) => {
+                let keycodes = self
+                    .server
+                    .keymap
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map_or_else(|| DEFAULT_MODIFIER_MAP.to_vec(), |t| t.modmap.clone());
                 self.reply(&xproto::GetModifierMappingReply {
                     sequence: 0,
                     length: 0,
-                    keycodes: MODIFIER_MAP.to_vec(),
+                    keycodes,
                 })?;
             }
             Request::GetPointerControl(_) => {
@@ -607,7 +638,7 @@ impl Connection {
                 self.reply(&bigreq::EnableReply {
                     sequence: 0,
                     length: 0,
-                    maximum_request_length: 4_194_303,
+                    maximum_request_length: MAX_REQUEST_LENGTH,
                 })?;
             }
             Request::RandrQueryVersion(_) => {
@@ -1124,7 +1155,10 @@ impl Connection {
         Ok(())
     }
 
-    fn get_property(&self, r: &xproto::GetPropertyRequest) -> xproto::GetPropertyReply {
+    /// Builds the `GetProperty` reply, and whether the property was deleted as
+    /// a result (`delete` set and the whole remainder returned), in which case
+    /// the caller sends the PropertyNotify.
+    fn get_property(&mut self, r: &xproto::GetPropertyRequest) -> (xproto::GetPropertyReply, bool) {
         let empty = xproto::GetPropertyReply {
             format: 0,
             sequence: 0,
@@ -1135,10 +1169,18 @@ impl Connection {
             value: vec![],
         };
         let Some(p) = self.properties.get(r.window, r.property) else {
-            return empty;
+            return (empty, false);
         };
-        if r.delete {
-            // deletion handled by the caller if needed
+        // a type mismatch (with a specific type asked for) reports what the
+        // property is, with no value and nothing deleted
+        if r.type_ != 0 && r.type_ != p.type_ {
+            let reply = xproto::GetPropertyReply {
+                format: p.format,
+                type_: p.type_,
+                bytes_after: p.data.len() as u32,
+                ..empty
+            };
+            return (reply, false);
         }
         let unit = (p.format / 8).max(1) as usize;
         let start = (r.long_offset as usize * 4).min(p.data.len());
@@ -1146,15 +1188,21 @@ impl Connection {
         // align to the property unit size
         let want = want - (want % unit);
         let value = p.data[start..start + want].to_vec();
-        xproto::GetPropertyReply {
+        let bytes_after = (p.data.len() - start - want) as u32;
+        let reply = xproto::GetPropertyReply {
             format: p.format,
             sequence: 0,
             length: 0,
             type_: p.type_,
-            bytes_after: (p.data.len() - start - want) as u32,
+            bytes_after,
             value_len: (value.len() / unit) as u32,
             value,
+        };
+        let deleted = r.delete && bytes_after == 0;
+        if deleted {
+            self.properties.remove(r.window, r.property);
         }
+        (reply, deleted)
     }
 
     /// Shared between `GetScreenResources`/`GetScreenResourcesCurrent`.
@@ -1489,7 +1537,14 @@ pub fn read_request(r: &mut impl Read) -> io::Result<Option<RawRequest>> {
         // including the now-2-unit header.
         let mut ext = [0u8; 4];
         r.read_exact(&mut ext)?;
-        u32::from_le_bytes(ext).saturating_sub(2)
+        let len = u32::from_le_bytes(ext);
+        if len > MAX_REQUEST_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("request length {len} exceeds the maximum {MAX_REQUEST_LENGTH}"),
+            ));
+        }
+        len.saturating_sub(2)
     } else {
         u32::from(short_len) - 1
     };
@@ -1697,11 +1752,12 @@ fn window_attributes() -> xproto::GetWindowAttributesReply {
     }
 }
 
-/// Standard modifier map (2 keycodes per modifier), using our X keycodes
-/// (= evdev code + 8): Shift, Lock, Control, Mod1(Alt), Mod2(Num), Mod3,
-/// Mod4(Super), Mod5.
+/// The modifier map (2 keycodes per modifier) served until the compositor
+/// keymap is known, from which the real one is derived: the pc105 layout,
+/// using our X keycodes (= evdev code + 8): Shift, Lock, Control, Mod1(Alt),
+/// Mod2(Num), Mod3, Mod4(Super), Mod5.
 #[rustfmt::skip]
-static MODIFIER_MAP: [u8; 16] = [
+static DEFAULT_MODIFIER_MAP: [u8; 16] = [
     50, 62,   // Shift: LeftShift(42), RightShift(54)
     66, 0,    // Lock: CapsLock(58)
     37, 105,  // Control: LeftCtrl(29), RightCtrl(97)

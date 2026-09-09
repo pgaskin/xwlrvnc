@@ -25,9 +25,8 @@ use super::*;
 /// the position differs, so each session contributes updates while the pointer
 /// is on it, bracketed by `enter`/`leave`.
 pub(super) struct CursorCap {
-    /// Source of the `enter`/`leave`/`position`/`hotspot` events. Held rather
-    /// than read: dropping it stops the compositor sending them.
-    #[allow(dead_code)]
+    /// Source of the `enter`/`leave`/`position`/`hotspot` events. Held for the
+    /// events, and destroyed with the context.
     cursor_session: ExtImageCopyCaptureCursorSessionV1,
     /// The image sub-session, from `get_capture_session()`.
     cap_session: Option<ExtImageCopyCaptureSessionV1>,
@@ -71,6 +70,19 @@ impl CursorCap {
             pos: None,
             frame_damage: Vec::new(),
         }
+    }
+}
+
+impl Drop for CursorCap {
+    fn drop(&mut self) {
+        // as for the screen context: the proxies don't destroy the objects
+        if let Some(frame) = self.frame.take() {
+            frame.destroy();
+        }
+        if let Some(session) = self.cap_session.take() {
+            session.destroy();
+        }
+        self.cursor_session.destroy();
     }
 }
 
@@ -300,11 +312,15 @@ impl ImageCopyCapture {
                 if let Some(ctx) = self.ctxs.get_mut(&wl_name)
                     && let Some(cc) = ctx.cursor_cap.as_mut()
                 {
-                    cc.cap_session = None;
+                    if let Some(frame) = cc.frame.take() {
+                        frame.destroy();
+                    }
+                    if let Some(session) = cc.cap_session.take() {
+                        session.destroy();
+                    }
                     cc.cap_ready = false;
                     cc.cap_size = None;
                     cc.cap_format = None;
-                    cc.frame = None;
                 }
             }
             _ => {}

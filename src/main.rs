@@ -36,9 +36,10 @@ mod config;
 
 use std::ffi::CString;
 use std::os::linux::net::SocketAddrExt;
-use std::os::unix::net::{SocketAddr, UnixListener};
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::process::Command;
-use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{fs, io, process, ptr, thread};
 
@@ -49,19 +50,27 @@ use crate::bridge::x11::randr::Screen;
 use crate::config::Config;
 
 static CHILD_PID: AtomicI32 = AtomicI32::new(0); // for forwarding signals
+static SPAWNING: AtomicBool = AtomicBool::new(false); // between starting the spawn and storing its pid
+static PENDING_SIG: AtomicI32 = AtomicI32::new(0); // a signal that arrived while spawning, to forward
 static SOCKET_PATH: AtomicPtr<nix::libc::c_char> = AtomicPtr::new(ptr::null_mut()); // leaked C string, to unlink on termination, null until display is bound
 
 /// Async-signal-safe (does not allocate) terminating-signal handler. If the
 /// child exists, forward the signal to it and return: the main thread is
 /// blocked in `child.wait()`, which then returns and runs the normal cleanup
-/// (i.e. we wait for the child to exit before exiting ourselves). If the signal
-/// arrives before the child is spawned (nothing to wait for), we clean up and
+/// (i.e. we wait for the child to exit before exiting ourselves). While the
+/// child is being spawned (any thread can take the signal, so no mask closes
+/// this window) the signal is parked for main to forward once it has the pid.
+/// If the signal arrives before that (nothing to wait for), we clean up and
 /// exit here directly.
 extern "C" fn handle_term(sig: nix::libc::c_int) {
-    let pid = CHILD_PID.load(Ordering::Acquire);
+    let pid = CHILD_PID.load(Ordering::SeqCst);
     if pid > 0 {
         // SAFETY: does not allocate
         unsafe { nix::libc::kill(pid, sig) };
+        return;
+    }
+    if SPAWNING.load(Ordering::SeqCst) {
+        PENDING_SIG.store(sig, Ordering::SeqCst);
         return;
     }
     let path = SOCKET_PATH.load(Ordering::Acquire);
@@ -172,13 +181,14 @@ fn main() {
     // no Wayland: unset WAYLAND_DISPLAY so it can't connect to the compositor
     // directly, and set XDG_SESSION_TYPE=x11 so toolkits pick the X backend.
     let (program, program_args) = command.split_first().expect("checked non-empty above");
-    let mut child = match Command::new(program)
+    SPAWNING.store(true, Ordering::SeqCst);
+    let spawned = Command::new(program)
         .args(program_args)
         .env("DISPLAY", format!(":{display}"))
         .env_remove("WAYLAND_DISPLAY")
         .env("XDG_SESSION_TYPE", "x11")
-        .spawn()
-    {
+        .spawn();
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
             crate::warning!("failed to spawn {program:?}: {e}");
@@ -186,7 +196,14 @@ fn main() {
             process::exit(1);
         }
     };
-    CHILD_PID.store(child.id() as i32, Ordering::Release);
+    CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
+    SPAWNING.store(false, Ordering::SeqCst);
+    // a terminating signal that landed during the spawn goes to the child now,
+    // as it would have a moment later
+    let sig = PENDING_SIG.swap(0, Ordering::SeqCst);
+    if sig != 0 {
+        unsafe { nix::libc::kill(child.id() as i32, sig) };
+    }
 
     let status = child.wait();
     let _ = fs::remove_file(&socket_path);
@@ -223,31 +240,70 @@ fn bind_display(forced: Option<u32>) -> io::Result<(u32, Vec<UnixListener>)> {
     };
     for n in candidates {
         let path = format!("/tmp/.X11-unix/X{n}");
-        if fs::symlink_metadata(&path).is_ok() {
-            if forced.is_some() {
+        match bind_sockets(&path) {
+            Ok(listeners) => {
+                crate::log!("serving X display :{n}");
+                return Ok((n, listeners));
+            }
+            Err(e) if forced.is_some() => {
                 return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("display :{n} is already in use"),
+                    e.kind(),
+                    format!("display :{n} is unavailable: {e}"),
                 ));
             }
-            continue; // already in use (possibly stale, but don't clobber it)
-        }
-        let fs_listener = match UnixListener::bind(&path) {
-            Ok(l) => l,
-            Err(e) if forced.is_some() => return Err(e),
             Err(_) => continue,
-        };
-        let mut listeners = vec![fs_listener];
-        if let Ok(addr) = SocketAddr::from_abstract_name(path.as_bytes())
-            && let Ok(abstract_listener) = UnixListener::bind_addr(&addr)
-        {
-            listeners.push(abstract_listener);
         }
-        crate::log!("serving X display :{n}");
-        return Ok((n, listeners));
     }
     Err(io::Error::new(
         io::ErrorKind::AddrInUse,
         "no free X display",
     ))
+}
+
+/// Binds one display's filesystem socket and its abstract twin. A socket file
+/// nothing answers on (left by a killed server) is reclaimed; anything else in
+/// the way, or another server holding the abstract name, means the display is
+/// in use.
+fn bind_sockets(path: &str) -> io::Result<Vec<UnixListener>> {
+    match fs::symlink_metadata(path) {
+        Err(_) => {}
+        Ok(m) if !m.file_type().is_socket() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("{path} exists and is not a socket"),
+            ));
+        }
+        Ok(_) => match UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "another server is listening",
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                crate::log!("removing stale socket {path}");
+                fs::remove_file(path)?;
+            }
+            // permission denied and the like: someone else's socket
+            Err(e) => return Err(e),
+        },
+    }
+    let mut listeners = vec![UnixListener::bind(path)?];
+    // libxcb tries the abstract name first, so another server holding it owns
+    // the display whatever the filesystem says (abstract names die with their
+    // process, so this one is never stale)
+    match SocketAddr::from_abstract_name(path.as_bytes())
+        .and_then(|addr| UnixListener::bind_addr(&addr))
+    {
+        Ok(l) => listeners.push(l),
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            let _ = fs::remove_file(path);
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "another server holds the abstract socket",
+            ));
+        }
+        Err(_) => {} // no abstract namespace; the filesystem socket suffices
+    }
+    Ok(listeners)
 }

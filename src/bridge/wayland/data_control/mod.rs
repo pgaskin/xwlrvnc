@@ -35,9 +35,10 @@ const MAX_PENDING_SENDS: usize = 8;
 /// pipe (the receiver sees a truncated value, which beats holding the fd).
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The live device, whichever protocol won. Held rather than read: dropping the
-/// proxy would destroy the device.
-#[allow(dead_code)]
+/// The live device, whichever protocol won. Held so it can be destroyed if ext
+/// replaces wlr: dropping the proxy does not send `destroy`, so the compositor
+/// keeps delivering selection events to it.
+#[allow(dead_code)] // the ext variant is only ever matched, never read
 pub(crate) enum DataDevice {
     Ext(ExtDataControlDeviceV1),
     Wlr(ZwlrDataControlDeviceV1),
@@ -202,7 +203,13 @@ impl State {
                 qh.clone(),
                 &self.server.clipboard,
             );
-            self.device = Some(DataDevice::Ext(device));
+            // Destroy the wlr device, not just drop it: the compositor would
+            // otherwise announce every selection change on both devices, and the
+            // second `update_selection` would clear the X owner and notify X
+            // clients of a change that didn't happen.
+            if let Some(DataDevice::Wlr(old)) = self.device.replace(DataDevice::Ext(device)) {
+                old.destroy();
+            }
         } else if self.device.is_none() {
             let Some(mgr) = &self.wlr_manager else { return };
             crate::log!("using zwlr-data-control-v1");

@@ -23,13 +23,14 @@ impl core::fmt::Write for Stderr {
 
 pub struct Environ<'a> {
     data: &'a [u8],
+    /// The file did not fit in the buffer, so variables may be missing.
+    pub truncated: bool,
 }
 
 impl<'a> Environ<'a> {
     pub fn read(buf: &'a mut [u8]) -> Result<Self, rustix::io::Errno> {
-        Ok(Self {
-            data: read_file(c"/proc/self/environ", buf)?,
-        })
+        let (data, truncated) = read_file(c"/proc/self/environ", buf)?;
+        Ok(Self { data, truncated })
     }
 
     pub fn get(&self, name: &[u8]) -> Option<&'a [u8]> {
@@ -46,17 +47,25 @@ impl<'a> Environ<'a> {
 pub struct Mappings<'a> {
     data: &'a mut [Mapping],
     len: usize,
+    /// The file or the entry table overflowed, so mappings may be missing.
+    pub truncated: bool,
 }
 
 impl<'a> Mappings<'a> {
     pub fn read(buf: &'a mut [Mapping], file_buf: &mut [u8]) -> Result<Self, rustix::io::Errno> {
-        let data = read_file(c"/proc/self/maps", file_buf)?;
-        let mut maps = Self { data: buf, len: 0 };
+        let (data, truncated) = read_file(c"/proc/self/maps", file_buf)?;
+        let mut maps = Self {
+            data: buf,
+            len: 0,
+            truncated,
+        };
         for line in data.split(|&b| b == b'\n') {
             if let Some(map) = Mapping::parse(line) {
                 if maps.len < maps.data.len() {
                     maps.data[maps.len] = map;
                     maps.len += 1;
+                } else {
+                    maps.truncated = true;
                 }
             }
         }
@@ -274,7 +283,12 @@ pub unsafe fn read_ptr(addr: usize) -> usize {
     (untag(addr) as *const usize).read_unaligned()
 }
 
-fn read_file<'a>(path: &core::ffi::CStr, buf: &'a mut [u8]) -> Result<&'a [u8], rustix::io::Errno> {
+/// Reads `path` into `buf`, returning the bytes read and whether the file had
+/// more than fit (a full buffer with the file not yet at EOF).
+fn read_file<'a>(
+    path: &core::ffi::CStr,
+    buf: &'a mut [u8],
+) -> Result<(&'a [u8], bool), rustix::io::Errno> {
     let fd = rustix::fs::openat(
         rustix::fs::CWD,
         path,
@@ -282,14 +296,36 @@ fn read_file<'a>(path: &core::ffi::CStr, buf: &'a mut [u8]) -> Result<&'a [u8], 
         rustix::fs::Mode::empty(),
     )?;
     let mut total = 0;
+    let mut eof = false;
     while total < buf.len() {
         match rustix::io::read(&fd, &mut buf[total..]) {
-            Ok(0) => break,
+            Ok(0) => {
+                eof = true;
+                break;
+            }
             Ok(n) => total += n,
             Err(e) => return Err(e),
         }
     }
-    Ok(&buf[..total])
+    if !eof {
+        // the buffer filled exactly at EOF is not a truncation
+        let mut probe = [0u8; 1];
+        eof = matches!(rustix::io::read(&fd, &mut probe), Ok(0));
+    }
+    Ok((&buf[..total], !eof))
+}
+
+/// Stops the process with a trap instruction: the panic handler's exit, since
+/// `no_std` has no `abort`.
+pub fn trap() -> ! {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("ud2", options(noreturn, nostack));
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("brk #0", options(noreturn, nostack));
+        #[cfg(target_arch = "arm")]
+        core::arch::asm!("udf #0", options(noreturn, nostack));
+    }
 }
 
 pub fn parse_hex(buf: &[u8], pos: &mut usize) -> Option<usize> {
