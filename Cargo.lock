@@ -881,7 +881,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xwlrvnc"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libc",
  "wayland-client",
