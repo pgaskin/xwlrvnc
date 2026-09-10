@@ -7,6 +7,12 @@ use crate::{
     util::{OutputRect, mm},
 };
 
+/// Largest screen we will accept, matching the range reported by
+/// `RRGetScreenSizeRange`. Screen bounds feed the framebuffer allocation, and a
+/// client picks the screen size, so without a bound a bad request could ask us
+/// to allocate an absurd framebuffer.
+pub const MAX_SCREEN: u16 = 16384;
+
 /// A RandR screen backed by Wayland outputs.
 pub struct Screen {
     pub width: u16,
@@ -156,6 +162,12 @@ impl Screen {
         self.outputs.iter().find(|o| o.crtc_id == crtc)
     }
 
+    pub fn output_by_wl_name(&self, wl_name: u32) -> Option<&Output> {
+        self.outputs
+            .iter()
+            .find(|o| o.wl_name == wl_name && o.is_wayland())
+    }
+
     pub fn mode_size(&self, id: u32) -> Option<(u16, u16)> {
         self.modes
             .iter()
@@ -212,9 +224,23 @@ impl Screen {
             .collect()
     }
 
-    /// Reconfigures an output (position + mode), returning true if changed.
+    /// Reconfigures a CRTC (position + mode, 0 to disable) in the model only,
+    /// as `RRSetCrtcConfig` does: the screen size is the client's to set with
+    /// `RRSetScreenSize`, so the bounds are left alone. Returns false for an
+    /// unknown CRTC or mode.
+    ///
+    /// For a Wayland output this is only right when the compositor is (or has
+    /// just been) driving the output at the mode's size; see
+    /// [`adopt_mode`](Self::adopt_mode) for the latter.
     pub fn set_crtc(&mut self, crtc: u32, x: i16, y: i16, mode: u32) -> bool {
-        let size = self.mode_size(mode);
+        let size = if mode == 0 {
+            None
+        } else {
+            match self.mode_size(mode) {
+                Some(size) => Some(size),
+                None => return false,
+            }
+        };
         let Some(o) = self.outputs.iter_mut().find(|o| o.crtc_id == crtc) else {
             return false;
         };
@@ -225,12 +251,89 @@ impl Screen {
             o.width = w;
             o.height = h;
         }
-        // a reconfiguration is a new config whether or not the bounds moved
-        let changed = self.recompute_bounds();
-        if !changed {
+        self.bump();
+        true
+    }
+
+    /// Puts every Wayland output back to what the compositor is actually
+    /// driving, and the screen back to their bounds: re-enables CRTCs a client
+    /// disabled, at a mode of the output's real size. For rolling back a
+    /// client's reconfiguration that the compositor then refused (RealVNC
+    /// disables the CRTC and resizes the screen *before* it asks for the mode,
+    /// and does not undo either when that fails, which would leave the X
+    /// screen a size the capture never fills and the output disabled).
+    /// Returns whether anything changed.
+    pub fn restore_outputs(&mut self) -> bool {
+        let mut changed = false;
+        for i in 0..self.outputs.len() {
+            let o = &self.outputs[i];
+            if !o.is_wayland() {
+                continue;
+            }
+            let (width, height) = (o.width, o.height);
+            let ok = self
+                .mode_size(o.mode)
+                .is_some_and(|size| size == (width, height));
+            if ok {
+                continue;
+            }
+            let listed = o
+                .mode_ids
+                .iter()
+                .copied()
+                .find(|&id| self.mode_size(id) == Some((width, height)));
+            let mode = match listed {
+                Some(id) => id,
+                None => self.alloc_mode(width, height, 0),
+            };
+            let o = &mut self.outputs[i];
+            o.mode = mode;
+            if !o.mode_ids.contains(&mode) {
+                o.mode_ids.push(mode);
+            }
+            changed = true;
+        }
+        self.relayout_physical();
+        let bounds = self.recompute_bounds();
+        if changed && !bounds {
             self.bump();
         }
-        changed
+        changed || bounds
+    }
+
+    /// After the compositor drove a Wayland output to a client's requested
+    /// size, switches its CRTC to the mode the client actually asked for (the
+    /// wl_output sync gave it a native mode of the same size), so the client
+    /// reads back what it set. A no-op unless the sizes agree.
+    pub fn adopt_mode(&mut self, crtc: u32, mode: u32) {
+        let Some((w, h)) = self.mode_size(mode) else {
+            return;
+        };
+        let Some(o) = self.outputs.iter_mut().find(|o| o.crtc_id == crtc) else {
+            return;
+        };
+        if o.width == w && o.height == h && o.mode != mode {
+            if !o.mode_ids.contains(&mode) {
+                o.mode_ids.push(mode);
+            }
+            o.mode = mode;
+            // the native mode of that size stood for what the compositor
+            // drives, which the client's mode now does
+            let native: Vec<u32> = self
+                .modes
+                .iter()
+                .filter(|m| m.ours && m.info.id != mode && (m.info.width, m.info.height) == (w, h))
+                .map(|m| m.info.id)
+                .collect();
+            self.outputs
+                .iter_mut()
+                .find(|o| o.crtc_id == crtc)
+                .unwrap()
+                .mode_ids
+                .retain(|m| !native.contains(m));
+            self.prune_modes();
+            self.bump();
+        }
     }
 
     /// Recomputes the X11 screen (i.e., bounding box of all outputs) size for
@@ -240,11 +343,13 @@ impl Screen {
         let mut h = 0u16;
         for o in &self.outputs {
             if o.connected && o.mode != 0 {
-                w = w.max(o.x.max(0) as u16 + o.width);
-                h = h.max(o.y.max(0) as u16 + o.height);
+                // saturating, since a client picks the crtc positions and
+                // `position + size` can leave u16 behind
+                w = w.max((o.x.max(0) as u16).saturating_add(o.width));
+                h = h.max((o.y.max(0) as u16).saturating_add(o.height));
             }
         }
-        let (w, h) = (w.max(1), h.max(1));
+        let (w, h) = (w.clamp(1, MAX_SCREEN), h.clamp(1, MAX_SCREEN));
         let changed = w != self.width || h != self.height;
         self.width = w;
         self.height = h;
@@ -285,8 +390,8 @@ impl Screen {
     }
 
     pub fn set_size(&mut self, width: u16, height: u16) {
-        self.width = width;
-        self.height = height;
+        self.width = width.clamp(1, MAX_SCREEN);
+        self.height = height.clamp(1, MAX_SCREEN);
         self.bump();
     }
 
@@ -336,13 +441,22 @@ impl Screen {
                 if unchanged {
                     return false;
                 }
+                // keep the mode if it already has this size; else reuse one of
+                // the output's listed modes with it (a client-created mode the
+                // compositor was just driven to); else allocate a native one
+                let listed = self.outputs[i]
+                    .mode_ids
+                    .iter()
+                    .copied()
+                    .find(|&id| self.mode_size(id) == Some((width, height)));
                 let mode = if same_mode {
                     self.outputs[i].mode
+                } else if let Some(id) = listed {
+                    id
                 } else {
                     self.alloc_mode(width, height, refresh_mhz)
                 };
                 let o = &mut self.outputs[i];
-                let old = o.mode;
                 o.lx = lx;
                 o.ly = ly;
                 o.lw = lw;
@@ -353,9 +467,21 @@ impl Screen {
                 if !o.mode_ids.contains(&mode) {
                     o.mode_ids.push(mode);
                 }
-                // the previous native mode is ours to retire
-                if old != mode && self.modes.iter().any(|m| m.info.id == old && m.ours) {
-                    self.outputs[i].mode_ids.retain(|&m| m != old);
+                // Any native mode of another size is ours to retire: a native
+                // mode only ever stands for what the compositor is driving now.
+                // (Looked up by size rather than by the previous CRTC mode, which
+                // is 0 when a client disabled the CRTC before changing it, as
+                // RealVNC does.)
+                let stale: Vec<u32> = self
+                    .modes
+                    .iter()
+                    .filter(|m| {
+                        m.ours && m.info.id != mode && self.outputs[i].mode_ids.contains(&m.info.id)
+                    })
+                    .map(|m| m.info.id)
+                    .collect();
+                if !stale.is_empty() {
+                    self.outputs[i].mode_ids.retain(|m| !stale.contains(m));
                     self.prune_modes();
                 }
             }
@@ -413,7 +539,7 @@ impl Screen {
 impl Output {
     /// Whether this output mirrors a real Wayland output (`wl_name` 0 is the
     /// synthetic default we start with before any output is known).
-    fn is_wayland(&self) -> bool {
+    pub fn is_wayland(&self) -> bool {
         self.wl_name != 0
     }
 }
@@ -481,4 +607,172 @@ fn pack_axis(items: &[(i32, i32, i32)]) -> Vec<i32> {
             .or_insert(px + plen);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A screen mirroring one 1280x800 Wayland output (registry name 7).
+    fn screen() -> Screen {
+        let mut s = Screen::new(640, 480);
+        assert!(s.sync_wayland_output(7, b"HEADLESS-1", 0, 0, 1280, 800, 1280, 800, 60_000));
+        s
+    }
+
+    fn the_output(s: &Screen) -> &Output {
+        s.output_by_wl_name(7).expect("the wayland output")
+    }
+
+    fn native_modes(s: &Screen) -> Vec<(u16, u16)> {
+        s.modes
+            .iter()
+            .filter(|m| m.ours)
+            .map(|m| (m.info.width, m.info.height))
+            .collect()
+    }
+
+    #[test]
+    fn wayland_output_replaces_the_default() {
+        let s = screen();
+        assert_eq!(s.outputs.len(), 1);
+        assert_eq!((s.width, s.height), (1280, 800));
+        assert_eq!(native_modes(&s), vec![(1280, 800)]);
+        assert_eq!(s.mode_size(the_output(&s).mode), Some((1280, 800)));
+    }
+
+    #[test]
+    fn set_crtc_leaves_the_screen_size_alone() {
+        // RRSetCrtcConfig never resizes the screen; that is RRSetScreenSize's
+        // job (and RealVNC disables the CRTC before it shrinks the screen)
+        let mut s = screen();
+        let crtc = the_output(&s).crtc_id;
+        let ts = s.config_timestamp;
+        assert!(s.set_crtc(crtc, 0, 0, 0));
+        assert_eq!(the_output(&s).mode, 0);
+        assert_eq!((s.width, s.height), (1280, 800));
+        assert_ne!(s.config_timestamp, ts);
+        assert!(
+            s.layout_rects().is_empty(),
+            "a disabled CRTC takes no input"
+        );
+        assert!(!s.set_crtc(crtc, 0, 0, 12345), "unknown mode");
+        assert!(!s.set_crtc(999, 0, 0, 0), "unknown crtc");
+    }
+
+    #[test]
+    fn set_size_is_clamped() {
+        let mut s = screen();
+        s.set_size(0, 40_000);
+        assert_eq!((s.width, s.height), (1, MAX_SCREEN));
+    }
+
+    #[test]
+    fn compositor_change_reuses_the_clients_mode_and_retires_the_native_one() {
+        let mut s = screen();
+        let (output, crtc) = (the_output(&s).output_id, the_output(&s).crtc_id);
+        // the client's sequence: create + add a mode, disable, resize, set
+        let info = ModeInfo {
+            id: 0,
+            width: 1024,
+            height: 640,
+            dot_clock: 0,
+            hsync_start: 0,
+            hsync_end: 0,
+            htotal: 1024,
+            hskew: 0,
+            vsync_start: 0,
+            vsync_end: 0,
+            vtotal: 640,
+            name_len: 0,
+            mode_flags: ModeFlag::from(0u32),
+        };
+        let client_mode = s.create_mode(info, b"1024x640_vnc".to_vec());
+        s.add_output_mode(output, client_mode);
+        assert!(s.set_crtc(crtc, 0, 0, 0));
+        s.set_size(1024, 640);
+        // ... and the compositor's answer, as a wl_output change
+        assert!(s.sync_wayland_output(7, b"HEADLESS-1", 0, 0, 1024, 640, 1024, 640, 60_000));
+        let o = the_output(&s);
+        assert_eq!((o.width, o.height), (1024, 640));
+        assert_eq!(
+            o.mode, client_mode,
+            "the listed mode of that size is reused"
+        );
+        assert_eq!((s.width, s.height), (1024, 640));
+        assert!(
+            native_modes(&s).is_empty(),
+            "the old native mode is retired even though the CRTC was disabled"
+        );
+        assert!(
+            s.modes.iter().any(|m| m.info.id == client_mode),
+            "the client's mode is the client's to destroy"
+        );
+        // adopting is then a no-op
+        let ts = s.config_timestamp;
+        s.adopt_mode(crtc, client_mode);
+        assert_eq!(s.config_timestamp, ts);
+    }
+
+    #[test]
+    fn adopt_mode_switches_to_the_clients_mode_of_the_same_size() {
+        let mut s = screen();
+        let crtc = the_output(&s).crtc_id;
+        // the compositor changed first (a native mode was allocated), then the
+        // client's own mode of that size is adopted
+        assert!(s.sync_wayland_output(7, b"HEADLESS-1", 0, 0, 800, 600, 800, 600, 60_000));
+        assert_eq!(native_modes(&s), vec![(800, 600)]);
+        let client_mode = s.alloc_mode(800, 600, 0);
+        s.modes.last_mut().unwrap().ours = false;
+        s.adopt_mode(crtc, client_mode);
+        assert_eq!(the_output(&s).mode, client_mode);
+        assert!(
+            native_modes(&s).is_empty(),
+            "the native mode of that size is pruned"
+        );
+        // a mode of another size is not adopted
+        let other = s.alloc_mode(640, 480, 0);
+        s.adopt_mode(crtc, other);
+        assert_eq!(the_output(&s).mode, client_mode);
+    }
+
+    #[test]
+    fn restore_outputs_undoes_a_refused_reconfiguration() {
+        let mut s = screen();
+        let crtc = the_output(&s).crtc_id;
+        let mode = the_output(&s).mode;
+        assert!(!s.restore_outputs(), "nothing to restore");
+        // the client disabled the CRTC and shrank the screen for a mode the
+        // compositor then refused
+        assert!(s.set_crtc(crtc, 0, 0, 0));
+        s.set_size(1000, 700);
+        assert!(s.restore_outputs());
+        let o = the_output(&s);
+        assert_eq!(o.mode, mode, "re-enabled at the output's real mode");
+        assert_eq!((o.width, o.height), (1280, 800));
+        assert_eq!(
+            (s.width, s.height),
+            (1280, 800),
+            "the screen is the outputs' bounds again"
+        );
+        assert_eq!(s.layout_rects().len(), 1);
+    }
+
+    #[test]
+    fn unchanged_compositor_state_is_a_no_op() {
+        let mut s = screen();
+        let ts = s.config_timestamp;
+        assert!(!s.sync_wayland_output(7, b"HEADLESS-1", 0, 0, 1280, 800, 1280, 800, 60_000));
+        assert_eq!(s.config_timestamp, ts);
+    }
+
+    #[test]
+    fn removing_the_output_prunes_its_native_mode() {
+        let mut s = screen();
+        assert!(s.remove_wayland_output(7));
+        assert!(s.outputs.is_empty());
+        assert!(native_modes(&s).is_empty());
+        assert_eq!((s.width, s.height), (1, 1));
+        assert!(!s.remove_wayland_output(7));
+    }
 }

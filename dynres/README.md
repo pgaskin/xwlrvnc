@@ -45,7 +45,7 @@ ldd vncserver-x11-core.patched
 FORCE_DYNRES=1 vncserver-x11-core -sdfsdf
 ```
 
-TODO: If you run xwlrvnc with the `-dynres` option, the environment variable will be automatically set.
+If you run xwlrvnc with the `-dynres` option, the `FORCE_DYNRES` environment variable is set automatically.
 
 To run a multiple instances of RealVNC for the same user, add the `-newinstance` flag to `vncserver-x11`. It must be the specified after other parameters.
 

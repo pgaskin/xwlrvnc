@@ -27,5 +27,12 @@ And try all of the following:
 - different pixel formats
 - adding/removing/changing outputs while connected
 - pausing and resuming capture for idle clients
+- dynamic resolution (`-dynres`, see [troubleshooting](./troubleshooting.md#dynamic-resolution))
+  - from RealVNC (with the hook), including the viewer's doubled request and a request for the current size
+  - from `xrandr` (`--newmode`/`--addmode`/`--mode`, `--off`/`--auto`, `--fb`)
+  - shrinking and growing, on rotated and scaled outputs, with two outputs
+  - a compositor-side mode change while a client is connected
+  - a compositor which refuses (or silently ignores) the mode, e.g. nested niri
+  - without `-dynres`, and with `-outmgr none`
 
 Also test the commands listed in [troubleshooting](./troubleshooting.md#ensuring-the-x-server-works-with-xlib).

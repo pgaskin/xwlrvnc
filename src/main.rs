@@ -153,6 +153,7 @@ fn main() {
     let geom = config.geometry.unwrap_or_default();
     let displayfd = config.displayfd;
     let nowrap = config.nowrap;
+    let dynres = config.dynres;
     let input = Arc::new(Input::new(geom.width, geom.height));
     let server = Arc::new(Server {
         config,
@@ -163,6 +164,7 @@ fn main() {
         framebuffer: Arc::new(bridge::capture::Framebuffer::default()),
         damage: bridge::damage::DamageSink::default(),
         cursor: bridge::cursor::CursorState::default(),
+        dynres: bridge::dynres::DynRes::default(),
         keymap: Mutex::new(None),
     });
 
@@ -198,13 +200,18 @@ fn main() {
     // no Wayland: unset WAYLAND_DISPLAY so it can't connect to the compositor
     // directly, and set XDG_SESSION_TYPE=x11 so toolkits pick the X backend.
     let (program, program_args) = command.split_first().expect("checked non-empty above");
-    CHILD.store(SPAWNING, Ordering::SeqCst);
-    let spawned = Command::new(program)
-        .args(program_args)
+    let mut cmd = Command::new(program);
+    cmd.args(program_args)
         .env("DISPLAY", format!(":{display}"))
         .env_remove("WAYLAND_DISPLAY")
-        .env("XDG_SESSION_TYPE", "x11")
-        .spawn();
+        .env("XDG_SESSION_TYPE", "x11");
+    if dynres {
+        // what the dynres hook (see dynres/) looks for before it patches out
+        // RealVNC's "-virtual" check and lets the feature turn on
+        cmd.env("FORCE_DYNRES", "1");
+    }
+    CHILD.store(SPAWNING, Ordering::SeqCst);
+    let spawned = cmd.spawn();
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {

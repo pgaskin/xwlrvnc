@@ -92,6 +92,36 @@ If you see a message like `unhandled request`, it needs to either be stubbed or 
 
 To get more verbose logs, add the `-Log *:stderr:100` RealVNC parameter. You can also filter the logs (`-Log` is comma-separated), see `vncserver-x11 -help all`.
 
+### Dynamic resolution
+
+Dynamic resolution needs `-dynres`, a compositor which supports `zwlr_output_manager_v1` (selected with `-outmgr`, default `auto`), and for RealVNC, the [hook](../dynres/README.md). It is meant for a headless or nested compositor (e.g., `WLR_BACKENDS=headless sway`), where the output supports arbitrary modes.
+
+When X client (vncagent-x11, or `xrandr`) sets the CRTC to a new mode, xwlrvnc attempts to change the output's mode and waits for it before replying to the X request.
+
+To test it without RealVNC:
+
+```bash
+# note: replace HEADLESS-1 with the output name from `xwlrvnc xrandr --query`
+xwlrvnc -dynres -verbose sh -c 'xrandr --newmode 1024x640 0 1024 0 0 0 640 0 0 0; xrandr --addmode HEADLESS-1 1024x640; xrandr --output HEADLESS-1 --mode 1024x640; xrandr --query'
+```
+
+If it says `Configure crtc 0 failed`, check the xwlrvnc log for:
+
+- `dynamic resolution is off (see -dynres)`: run with `-dynres`.
+- `output configuration is off (see -outmgr)`: `-outmgr none` was given.
+- `the compositor has no zwlr_output_manager_v1`: the compositor does not support changing output
+- `the compositor accepted ... but the output did not change`: the compositor accepted the configuration but ignored it (nested niri does this since it always uses the window size).
+- `the compositor rejected ...`: the compositor refused the mode (probably because the output doesn't support it)
+
+
+Note that RealVNC will set all CRTCs to the requested size, but will not update the position, so outputs may overlap with multiple monitors unless the compositor re-arranges them automatically (niri does, and so does sway for outputs without an explicit `position`).
+
+On a rotated output, the mode is set in the native panel orientation, and on a scaled output the size is in physical pixels, as everything else in RandR.
+
+RealVNC disables the CRTC and resizes the screen before it asks for the new mode, and does not undo either if that fails. As a workaround, xwlrvnc restores the original output configuration if that happens (and logs `restored the screen to the compositor's outputs`).
+
+Also, note that different compositor implementations validate the refresh rate for a custom mode differently (wlroots' nested backends reject any but 0, but niri ignores 0), so xwlrvnc tries both.
+
 ### Performance issues
 
 Try `-profile` with and without `-nodamage`.

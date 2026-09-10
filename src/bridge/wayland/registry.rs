@@ -6,6 +6,7 @@
 //! it needs is present.
 
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+use wayland_protocols_wlr::output_management::v1::client::zwlr_output_manager_v1::ZwlrOutputManagerV1;
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 
 use super::*;
@@ -96,6 +97,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     let mgr: ZwlrVirtualPointerManagerV1 = bind(registry, name, version, 2, qh);
                     state.pointer_backend = Some(Box::new(mgr));
                     state.try_init_virtual_input(conn, qh);
+                } else if interface == ZwlrOutputManagerV1::interface().name
+                    && config.outmgr_wants_wlr()
+                {
+                    let mgr: ZwlrOutputManagerV1 = bind(registry, name, version, 4, qh);
+                    crate::log!("using zwlr-output-management-v1 for dynamic resolution");
+                    state.output_config = Some(OutputConfig::new(mgr));
+                    state.server.dynres.set_available(true);
                 } else if interface == ZwpVirtualKeyboardManagerV1::interface().name {
                     let mgr: ZwpVirtualKeyboardManagerV1 = bind(registry, name, version, 1, qh);
                     state.keyboard_backend = Some(Box::new(mgr));

@@ -9,6 +9,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod cursor;
 pub mod damage;
+pub mod dynres;
 pub mod event;
 pub mod input;
 pub mod keymap;

@@ -23,6 +23,7 @@ use crate::bridge::clipboard::Sel;
 use crate::bridge::event::Client;
 use crate::bridge::x11::atom::XA_INTEGER;
 use crate::bridge::x11::ext::EXTENSIONS;
+use crate::bridge::x11::randr as randr_screen;
 use crate::bridge::x11::{CLIENT_RESOURCE_ID_BASE, SELECTION_FETCH_WINDOW};
 use crate::util::{Geometry, bbox, mm};
 
@@ -30,6 +31,12 @@ use crate::util::{Geometry, bbox, mm};
 /// advertised by `BigreqEnable`. Anything bigger is a broken or hostile
 /// client, and is disconnected rather than allocated for.
 const MAX_REQUEST_LENGTH: u32 = 4_194_303;
+
+/// How long `RRSetCrtcConfig` waits for the compositor to change an output's
+/// mode (`-dynres`). Well past what a compositor needs, and short enough that
+/// a client blocked in Xlib on a compositor that never answers gets its
+/// failure rather than a hang.
+const DYNRES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct Connection {
     reader: BufReader<UnixStream>,
@@ -657,8 +664,8 @@ impl Connection {
                     length: 0,
                     min_width: 8,
                     min_height: 8,
-                    max_width: 16384,
-                    max_height: 16384,
+                    max_width: randr_screen::MAX_SCREEN,
+                    max_height: randr_screen::MAX_SCREEN,
                 })?;
             }
             Request::RandrGetScreenResources(_) => {
@@ -917,23 +924,28 @@ impl Connection {
                 self.server.screen.lock().unwrap().destroy_mode(r.mode);
             }
             Request::RandrSetCrtcConfig(r) => {
-                let timestamp = {
-                    let mut s = self.server.screen.lock().unwrap();
-                    s.set_crtc(r.crtc, r.x, r.y, r.mode);
-                    s.timestamp
-                };
-                // the framebuffer, the input mapping and the capture positions
-                // all follow the screen model, exactly as for a change the
-                // compositor made
-                self.server.sync_screen(true);
+                let status = self.set_crtc_config(&r);
+                let timestamp = self.server.screen.lock().unwrap().timestamp;
                 self.reply(&randr::SetCrtcConfigReply {
-                    status: randr::SetConfig::SUCCESS,
+                    status,
                     sequence: 0,
                     length: 0,
                     timestamp,
                 })?;
             }
             Request::RandrSetScreenSize(r) => {
+                // The screen is the client's to size (the CRTCs must fit, which
+                // is not enforced: a client that shrinks the screen before its
+                // CRTC just gets clipped until it does), and the framebuffer,
+                // the input mapping and the capture positions follow.
+                if r.width == 0
+                    || r.height == 0
+                    || r.width > randr_screen::MAX_SCREEN
+                    || r.height > randr_screen::MAX_SCREEN
+                {
+                    return self.send_error(xproto::VALUE_ERROR, major, u16::from(minor));
+                }
+                crate::vlog!("client set the screen size to {}x{}", r.width, r.height);
                 self.server
                     .screen
                     .lock()
@@ -1131,6 +1143,11 @@ impl Connection {
             Request::MapWindow(_) | Request::ConfigureWindow(_) | Request::UnmapWindow(_) => {
                 // no-op: we don't support windows
             }
+            Request::GrabServer(_) | Request::UngrabServer(_) => {
+                // no-op: there are no other clients to freeze out of a
+                // reconfiguration (xrandr and vncagent bracket their RandR
+                // changes in these), and nothing we do is affected by a grab
+            }
             Request::CreateGC(_) | Request::ChangeGC(_) | Request::FreeGC(_) => {
                 // no-op: we don't support drawing
             }
@@ -1206,6 +1223,144 @@ impl Connection {
             self.properties.remove(r.window, r.property);
         }
         (reply, deleted)
+    }
+
+    /// `RRSetCrtcConfig`. Disabling a CRTC, or giving it a mode the output is
+    /// already running at, only touches the model. Any other mode needs the
+    /// compositor to change the output, which `-dynres` carries over and waits
+    /// for (so the reply is truthful and the model already reflects what
+    /// happened); without it the request fails, since claiming a size the
+    /// capture will never have would leave the client reading a screen that
+    /// does not exist.
+    fn set_crtc_config(&self, r: &randr::SetCrtcConfigRequest) -> randr::SetConfig {
+        enum Plan {
+            Local,
+            Compositor {
+                wl_name: u32,
+                name: String,
+                width: u16,
+                height: u16,
+            },
+        }
+        let plan = {
+            let s = self.server.screen.lock().unwrap();
+            let Some(o) = s.output_by_crtc(r.crtc) else {
+                crate::warning!("client configured unknown crtc {}", r.crtc);
+                return randr::SetConfig::FAILED;
+            };
+            let name = String::from_utf8_lossy(&o.name).into_owned();
+            if r.rotation != randr::Rotation::ROTATE0 {
+                crate::warning!("client asked to rotate output {name:?}, which is unsupported");
+                return randr::SetConfig::FAILED;
+            }
+            if r.mode == 0 {
+                crate::vlog!("client disabled output {name:?}");
+                Plan::Local
+            } else {
+                let Some((width, height)) = s.mode_size(r.mode) else {
+                    crate::warning!(
+                        "client configured output {name:?} with unknown mode {}",
+                        r.mode
+                    );
+                    return randr::SetConfig::FAILED;
+                };
+                crate::vlog!(
+                    "client set output {name:?} to {width}x{height} at {},{} (currently {}x{})",
+                    r.x,
+                    r.y,
+                    o.width,
+                    o.height
+                );
+                if !o.is_wayland() || (o.width == width && o.height == height) {
+                    Plan::Local
+                } else {
+                    Plan::Compositor {
+                        wl_name: o.wl_name,
+                        name,
+                        width,
+                        height,
+                    }
+                }
+            }
+        };
+        match plan {
+            Plan::Local => {
+                let ok = self
+                    .server
+                    .screen
+                    .lock()
+                    .unwrap()
+                    .set_crtc(r.crtc, r.x, r.y, r.mode);
+                if !ok {
+                    return randr::SetConfig::FAILED;
+                }
+                // the framebuffer, the input mapping and the capture positions
+                // all follow the screen model, exactly as for a change the
+                // compositor made
+                self.server.sync_screen(true);
+                randr::SetConfig::SUCCESS
+            }
+            Plan::Compositor {
+                wl_name,
+                name,
+                width,
+                height,
+            } => {
+                let config = &self.server.config;
+                if !config.dynres {
+                    crate::warning!(
+                        "client asked for {width}x{height} on output {name:?}, but \
+                         dynamic resolution is off (see -dynres); refusing"
+                    );
+                    return randr::SetConfig::FAILED;
+                }
+                if !self.server.dynres.available() {
+                    let why = if config.outmgr == crate::config::OutMgrType::None {
+                        "output configuration is off (see -outmgr)"
+                    } else {
+                        "the compositor offers no way to change it"
+                    };
+                    crate::warning!(
+                        "client asked for {width}x{height} on output {name:?}, but {why}; refusing"
+                    );
+                    return randr::SetConfig::FAILED;
+                }
+                crate::log!("client asked for {width}x{height} on output {name:?}");
+                // blocks until the compositor has (or has not) changed the
+                // output and the model has been rebuilt from what it did
+                match self
+                    .server
+                    .dynres
+                    .change_mode(wl_name, width, height, DYNRES_TIMEOUT)
+                {
+                    Ok(()) => {
+                        // the model got a native mode of the new size from the
+                        // wl_output sync; hand the CRTC the client's own mode
+                        // so it reads back what it set
+                        self.server
+                            .screen
+                            .lock()
+                            .unwrap()
+                            .adopt_mode(r.crtc, r.mode);
+                        randr::SetConfig::SUCCESS
+                    }
+                    Err(reason) => {
+                        crate::warning!(
+                            "could not set {width}x{height} on output {name:?}: {reason}"
+                        );
+                        // the client may already have disabled the CRTC and
+                        // resized the screen for a mode that never came; put
+                        // both back to what the compositor is really showing
+                        let changed = self.server.screen.lock().unwrap().restore_outputs();
+                        if changed {
+                            crate::log!("restored the screen to the compositor's outputs");
+                            self.server.sync_screen(true);
+                        }
+                        randr::SetConfig::FAILED
+                    }
+                }
+            }
+        }
     }
 
     /// Shared between `GetScreenResources`/`GetScreenResourcesCurrent`.

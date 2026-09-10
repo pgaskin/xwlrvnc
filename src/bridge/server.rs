@@ -4,6 +4,7 @@ use crate::bridge::capture::Framebuffer;
 use crate::bridge::clipboard::Clipboard;
 use crate::bridge::cursor::CursorState;
 use crate::bridge::damage::DamageSink;
+use crate::bridge::dynres::DynRes;
 use crate::bridge::event::EventSink;
 use crate::bridge::input::Input;
 use crate::bridge::keymap::KeyTable;
@@ -21,6 +22,9 @@ pub(crate) struct Server {
     pub framebuffer: Arc<Framebuffer>,
     pub damage: DamageSink,
     pub cursor: CursorState,
+    /// Resolution changes an X client asked for, for the Wayland thread to carry
+    /// to the compositor (`-dynres`).
+    pub dynres: DynRes,
     /// X keysym and modifier tables built from the compositor keymap (`None`
     /// until received).
     pub keymap: Mutex<Option<KeyTable>>,

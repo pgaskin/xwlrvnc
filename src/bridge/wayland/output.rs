@@ -90,11 +90,14 @@ impl State {
             );
         }
         self.maybe_start_captures(qh);
+        // a pending -dynres request is answered by exactly this kind of change
+        self.dynres_output_changed(wl_name);
     }
 
     pub(super) fn remove_output(&mut self, wl_name: u32) {
         self.outputs.remove(&wl_name);
         self.capture.remove_output(wl_name);
+        self.dynres_output_removed(wl_name);
         // Removing an output can shrink the screen and shift the rest, which
         // sync_screen propagates the same way it does on add or change.
         let changed = self

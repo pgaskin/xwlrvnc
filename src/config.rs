@@ -15,6 +15,8 @@ define_config! {
         screen: ScreenType = choice("auto"),
         /// clipboard protocol
         clipboard: ClipboardType = choice("auto"),
+        /// output configuration protocol (used for dynamic resolution)
+        outmgr: OutMgrType = choice("auto"),
         /// cursor source (if none, it's baked into the screen capture)
         cursor: CursorType = choice("auto"),
         /// use the wayland seat with this name
@@ -23,6 +25,8 @@ define_config! {
         geometry: Option<Geometry> = value("WxH"),
         /// cap the screen capture frame rate (default is optimized for vncagent-x11)
         fps: Option<u32> = value("n"),
+        /// let clients change the resolution (RealVNC also needs the dynres hook)
+        dynres: bool = flag,
         /// don't advertise the DAMAGE extension (force clients to poll)
         nodamage: bool = flag,
         /// don't bridge the PRIMARY selection (middle-click paste of selected text)
@@ -64,6 +68,18 @@ impl ArgEnum for ScreenType {
     }
 }
 
+impl ArgEnum for OutMgrType {
+    const VARIANTS: &'static [&'static str] = &["auto", "none", "wlr"];
+    fn from_arg(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "none" => Self::None,
+            "wlr" => Self::Wlr,
+            _ => return None,
+        })
+    }
+}
+
 impl ArgEnum for ClipboardType {
     const VARIANTS: &'static [&'static str] = &["auto", "none", "wlr", "ext"];
     fn from_arg(s: &str) -> Option<Self> {
@@ -99,6 +115,19 @@ pub enum ClipboardType {
     Ext,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutMgrType {
+    Auto,
+    None,
+    Wlr,
+}
+
+impl OutMgrType {
+    pub fn wants_wlr(self) -> bool {
+        matches!(self, Self::Auto | Self::Wlr)
+    }
+}
+
 impl ScreenType {
     pub fn wants_screencopy(self) -> bool {
         matches!(self, Self::Auto | Self::Screencopy)
@@ -120,5 +149,11 @@ impl ClipboardType {
 impl Config {
     pub fn damage(&self) -> bool {
         !self.nodamage
+    }
+
+    /// Whether to bind wlr-output-management: dynamic resolution is on, and the
+    /// protocol choice allows it.
+    pub fn outmgr_wants_wlr(&self) -> bool {
+        self.dynres && self.outmgr.wants_wlr()
     }
 }

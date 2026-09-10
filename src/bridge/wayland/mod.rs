@@ -37,12 +37,14 @@ mod capture;
 mod data_control;
 mod input;
 mod output;
+mod output_config;
 mod registry;
 mod shm;
 use capture::Capture;
 use data_control::{DataDevice, PendingSend};
 use input::{KeyboardBackend, PointerBackend};
 use output::OutputAcc;
+use output_config::OutputConfig;
 use shm::{ShmBuffer, blit_channels, channel_map, create_shm_buffer, pixel_layout};
 
 /// Connects and synchronously reads the initial output geometry, so the X server
@@ -89,6 +91,7 @@ pub fn spawn(server: Arc<Server>) {
         capture_active: false,
         vkbd_keymap: None,
         keymap_hash: None,
+        output_config: None,
     };
 
     // settle the registry globals, and the events they trigger, before the
@@ -103,8 +106,15 @@ pub fn spawn(server: Arc<Server>) {
         if i == 0 {
             state.registry_settled = true;
             state.maybe_start_captures(&qh);
+            if state.server.config.outmgr_wants_wlr() && state.output_config.is_none() {
+                crate::warning!(
+                    "dynamic resolution is unavailable: the compositor has no \
+                     zwlr_output_manager_v1 (clients' resolution changes will fail)"
+                );
+            }
         }
     }
+    let wake_fd = state.server.dynres.wake_fd();
 
     std::thread::spawn(move || {
         // A manual loop rather than blocking_dispatch, so capture can self-pace:
@@ -118,11 +128,13 @@ pub fn spawn(server: Arc<Server>) {
             // before the tick, so a stalled clipboard send makes progress on
             // every pass however we got here
             state.flush_pending_sends();
+            state.tick_dynres(&qh);
             let timeout = state.tick_captures(&qh);
             if let Err(e) = conn.flush() {
                 crate::warning!(
                     "wayland connection lost on flush: {e}; screen capture has stopped"
                 );
+                state.wayland_lost();
                 return;
             }
             let Some(guard) = conn.prepare_read() else {
@@ -141,8 +153,18 @@ pub fn spawn(server: Arc<Server>) {
                 events: libc::POLLOUT,
                 revents: 0,
             }));
+            // wake as soon as an X client parks a resolution change (-dynres),
+            // rather than after the capture interval
+            pfds.push(libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
             let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
             let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
+            if n > 0 && pfds.last().is_some_and(|p| p.revents & libc::POLLIN != 0) {
+                state.server.dynres.drain_wake();
+            }
             if n > 0 && pfds[0].revents & libc::POLLIN != 0 {
                 match guard.read() {
                     Ok(_) => {}
@@ -152,6 +174,7 @@ pub fn spawn(server: Arc<Server>) {
                         crate::warning!(
                             "wayland connection lost on read: {e}; screen capture has stopped"
                         );
+                        state.wayland_lost();
                         return;
                     }
                 }
@@ -200,6 +223,9 @@ struct State {
     /// The compositor keymap as a duped fd and size, kept because the keymap
     /// event can arrive either side of the virtual keyboard existing.
     vkbd_keymap: Option<(u32, OwnedFd, u32)>,
+    /// The wlr-output-management client, bound only with `-dynres`, through
+    /// which clients' resolution changes reach the compositor.
+    output_config: Option<OutputConfig>,
     /// Hash of the last keymap text loaded, to ignore re-broadcasts. Forwarding a
     /// keymap to our virtual keyboard makes the compositor re-emit it to our
     /// passive wl_keyboard (sway does, when we're the only input device), and
@@ -209,6 +235,14 @@ struct State {
 }
 
 impl State {
+    /// The compositor is gone: nothing will answer a resolution change any
+    /// more, so fail the one in progress and make the X side refuse the rest
+    /// outright rather than wait out its timeout each time.
+    fn wayland_lost(&mut self) {
+        self.dynres_fail("the wayland connection was lost");
+        self.server.dynres.set_available(false);
+    }
+
     /// Commits to a seat, wiring up clipboard and virtual input, and creating
     /// its passive keyboard (for the keymap) and pointer (for cursor sessions)
     /// for whatever capabilities it has announced so far. Any other pending
