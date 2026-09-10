@@ -28,6 +28,8 @@ To configure RealVNC, just run it directly under Xwayland, use the cli options, 
 
 If you plan to use `-dynres` to enable dynamic resolutions, you'll also need to [install the hook](./dynres/README.md).
 
+As of 2026-09-09, if you are using niri, you should build it with [niri-wm/niri#4548](https://github.com/niri-wm/niri/pull/4548) and [niri-wm/niri#4554](https://github.com/niri-wm/niri/pull/4554).
+
 ### Documentation
 
 - [Troubleshooting](./docs/troubleshooting.md)
