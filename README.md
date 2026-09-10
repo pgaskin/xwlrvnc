@@ -99,7 +99,7 @@ The fake X server implements:
 - XRandR (monitor layout).
 - XDamage (screen damage tracking).
 
-I've tested this against niri 26.04 (with wl-uinput-proxy) and sway 1.11.
+I've tested this against niri 26.04 (with wl-uinput-proxy, and with [niri-wm/niri#4548](https://github.com/niri-wm/niri/pull/4548)/[niri-wm/niri#4554](https://github.com/niri-wm/niri/pull/4554)), sway 1.11, and cage 0.3.1.
 
 ### Compositor requirements
 
