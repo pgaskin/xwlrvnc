@@ -1,6 +1,6 @@
 [package]
 name = "xwlrvnc"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 license = "MIT"
 description = "Fake X server backed by a Wayland display, implementing just enough for RealVNC to work on it"
