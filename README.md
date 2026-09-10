@@ -30,6 +30,14 @@ If you plan to use `-dynres` to enable dynamic resolutions, you'll also need to 
 
 As of 2026-09-09, if you are using niri, you should build it with [niri-wm/niri#4548](https://github.com/niri-wm/niri/pull/4548) and [niri-wm/niri#4554](https://github.com/niri-wm/niri/pull/4554).
 
+##### Other VNC servers
+
+If you are using this with x11vnc, specify the `-nomodtweak` and `-xrandr` options.
+
+Other VNC server implementations have not been tested.
+
+This also works well for some other tools, e.g., ffmpeg x11grab.
+
 ### Documentation
 
 - [Troubleshooting](./docs/troubleshooting.md)
@@ -99,7 +107,7 @@ The fake X server implements:
 - XRandR (monitor layout).
 - XDamage (screen damage tracking).
 
-I've tested this against niri 26.04 (with wl-uinput-proxy, and with [niri-wm/niri#4548](https://github.com/niri-wm/niri/pull/4548)/[niri-wm/niri#4554](https://github.com/niri-wm/niri/pull/4554)), sway 1.11, and cage 0.3.1.
+I've tested this against niri 26.04 (with wl-uinput-proxy, and with [niri-wm/niri#4548](https://github.com/niri-wm/niri/pull/4548)/[niri-wm/niri#4554](https://github.com/niri-wm/niri/pull/4554)), sway 1.11, labwc 0.9.6, and cage 0.3.1.
 
 ### Compositor requirements
 
