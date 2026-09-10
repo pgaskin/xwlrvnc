@@ -39,7 +39,7 @@ use std::os::linux::net::SocketAddrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{fs, io, process, ptr, thread};
 
@@ -49,10 +49,15 @@ use crate::bridge::x11::conn::Connection;
 use crate::bridge::x11::randr::Screen;
 use crate::config::Config;
 
-static CHILD_PID: AtomicI32 = AtomicI32::new(0); // for forwarding signals
-static SPAWNING: AtomicBool = AtomicBool::new(false); // between starting the spawn and storing its pid
+/// The wrapped child, for forwarding signals: 0 before it is spawned, `SPAWNING`
+/// while the spawn is in progress, its pid after. One word, so a signal handler
+/// never sees a torn state (with the pid and a spawning flag as two atomics, a
+/// handler that read pid 0 just before the spawn finished would then read
+/// "not spawning" and exit under a live child).
+static CHILD: AtomicI32 = AtomicI32::new(0);
+const SPAWNING: i32 = -1;
 static PENDING_SIG: AtomicI32 = AtomicI32::new(0); // a signal that arrived while spawning, to forward
-static SOCKET_PATH: AtomicPtr<nix::libc::c_char> = AtomicPtr::new(ptr::null_mut()); // leaked C string, to unlink on termination, null until display is bound
+static SOCKET_PATH: AtomicPtr<libc::c_char> = AtomicPtr::new(ptr::null_mut()); // leaked C string, to unlink on termination, null until display is bound
 
 /// Async-signal-safe (does not allocate) terminating-signal handler. If the
 /// child exists, forward the signal to it and return: the main thread is
@@ -62,24 +67,36 @@ static SOCKET_PATH: AtomicPtr<nix::libc::c_char> = AtomicPtr::new(ptr::null_mut(
 /// this window) the signal is parked for main to forward once it has the pid.
 /// If the signal arrives before that (nothing to wait for), we clean up and
 /// exit here directly.
-extern "C" fn handle_term(sig: nix::libc::c_int) {
-    let pid = CHILD_PID.load(Ordering::SeqCst);
-    if pid > 0 {
+extern "C" fn handle_term(sig: libc::c_int) {
+    let child = CHILD.load(Ordering::SeqCst);
+    if child > 0 {
         // SAFETY: does not allocate
-        unsafe { nix::libc::kill(pid, sig) };
+        unsafe { libc::kill(child, sig) };
         return;
     }
-    if SPAWNING.load(Ordering::SeqCst) {
+    if child == SPAWNING {
         PENDING_SIG.store(sig, Ordering::SeqCst);
+        // The spawn may have finished between the load and the store, with
+        // main having already swapped the (then empty) pending signal out; it
+        // won't look again. So whoever swaps a non-zero signal out delivers
+        // it, and exactly one of us does.
+        let child = CHILD.load(Ordering::SeqCst);
+        if child > 0 {
+            let sig = PENDING_SIG.swap(0, Ordering::SeqCst);
+            if sig != 0 {
+                // SAFETY: does not allocate
+                unsafe { libc::kill(child, sig) };
+            }
+        }
         return;
     }
     let path = SOCKET_PATH.load(Ordering::Acquire);
     if !path.is_null() {
         // SAFETY: does not allocate, path is a leaked C string
-        unsafe { nix::libc::unlink(path) };
+        unsafe { libc::unlink(path) };
     }
     // SAFETY: does not allocate
-    unsafe { nix::libc::_exit(128 + sig) };
+    unsafe { libc::_exit(128 + sig) };
 }
 
 fn install_cleanup(socket_path: &str) {
@@ -88,13 +105,13 @@ fn install_cleanup(socket_path: &str) {
         .into_raw();
     SOCKET_PATH.store(leaked, Ordering::Release);
     unsafe {
-        let mut sa: nix::libc::sigaction = std::mem::zeroed();
+        let mut sa: libc::sigaction = std::mem::zeroed();
         // This only affects us since the child will reset signal dispositions
         // on exec.
-        sa.sa_sigaction = handle_term as extern "C" fn(nix::libc::c_int) as usize;
-        nix::libc::sigemptyset(&mut sa.sa_mask);
-        for sig in [nix::libc::SIGINT, nix::libc::SIGTERM, nix::libc::SIGHUP] {
-            nix::libc::sigaction(sig, &sa, ptr::null_mut());
+        sa.sa_sigaction = handle_term as extern "C" fn(libc::c_int) as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::sigaction(sig, &sa, ptr::null_mut());
         }
     }
 }
@@ -181,7 +198,7 @@ fn main() {
     // no Wayland: unset WAYLAND_DISPLAY so it can't connect to the compositor
     // directly, and set XDG_SESSION_TYPE=x11 so toolkits pick the X backend.
     let (program, program_args) = command.split_first().expect("checked non-empty above");
-    SPAWNING.store(true, Ordering::SeqCst);
+    CHILD.store(SPAWNING, Ordering::SeqCst);
     let spawned = Command::new(program)
         .args(program_args)
         .env("DISPLAY", format!(":{display}"))
@@ -191,21 +208,24 @@ fn main() {
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
+            CHILD.store(0, Ordering::SeqCst);
             crate::warning!("failed to spawn {program:?}: {e}");
             let _ = fs::remove_file(&socket_path);
             process::exit(1);
         }
     };
-    CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
-    SPAWNING.store(false, Ordering::SeqCst);
+    CHILD.store(child.id() as i32, Ordering::SeqCst);
     // a terminating signal that landed during the spawn goes to the child now,
-    // as it would have a moment later
+    // as it would have a moment later (see handle_term for why the swap)
     let sig = PENDING_SIG.swap(0, Ordering::SeqCst);
     if sig != 0 {
-        unsafe { nix::libc::kill(child.id() as i32, sig) };
+        unsafe { libc::kill(child.id() as i32, sig) };
     }
 
     let status = child.wait();
+    // the pid is reaped and could be reused; a signal from here on exits us
+    // directly, which is all that is left to do
+    CHILD.store(0, Ordering::SeqCst);
     let _ = fs::remove_file(&socket_path);
     match status {
         Ok(status) => process::exit(status.code().unwrap_or(1)),
@@ -217,9 +237,26 @@ fn main() {
 }
 
 fn accept_loop(listener: UnixListener, server: Arc<Server>) {
+    // SAFETY: getuid cannot fail
+    let uid = unsafe { libc::getuid() };
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // There is no X authentication, and the abstract socket has no
+                // filesystem permissions either, so the peer's uid is all that
+                // keeps other local users off the display (and its screen,
+                // input and clipboard). Only our own user, and root, get in.
+                match peer_uid(&stream) {
+                    Ok(peer) if peer == uid || peer == 0 => {}
+                    Ok(peer) => {
+                        crate::warning!("rejecting X connection from uid {peer}");
+                        continue;
+                    }
+                    Err(e) => {
+                        crate::warning!("rejecting X connection: cannot get peer credentials: {e}");
+                        continue;
+                    }
+                }
                 let server = server.clone();
                 thread::spawn(move || {
                     if let Err(e) = Connection::new(stream, server).and_then(Connection::run) {
@@ -230,6 +267,27 @@ fn accept_loop(listener: UnixListener, server: Arc<Server>) {
             Err(e) => crate::warning!("accept failed: {e}"),
         }
     }
+}
+
+/// The uid of the process at the other end of a unix socket.
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED fills in a ucred, and we pass its size
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cred.uid)
 }
 
 fn bind_display(forced: Option<u32>) -> io::Result<(u32, Vec<UnixListener>)> {

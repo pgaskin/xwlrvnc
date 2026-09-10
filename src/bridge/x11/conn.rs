@@ -57,8 +57,7 @@ impl Connection {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT_ID: AtomicU32 = AtomicU32::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let client = Arc::new(Client::new(stream.try_clone()?));
-        server.events.register(client.clone());
+        let client = Client::new(stream.try_clone()?)?;
         Ok(Self {
             reader: BufReader::new(stream),
             client,
@@ -76,6 +75,9 @@ impl Connection {
 
     pub fn run(mut self) -> io::Result<()> {
         self.handshake()?;
+        // only now: an event fanned out from another thread before the setup
+        // bytes were queued would land ahead of them on the wire
+        self.server.events.register(self.client.clone());
         while let Some(raw) = read_request(&mut self.reader)? {
             self.seq = self.seq.wrapping_add(1);
             self.client.set_seq(self.seq);
@@ -915,13 +917,15 @@ impl Connection {
                 self.server.screen.lock().unwrap().destroy_mode(r.mode);
             }
             Request::RandrSetCrtcConfig(r) => {
-                let (timestamp, geom) = {
+                let timestamp = {
                     let mut s = self.server.screen.lock().unwrap();
                     s.set_crtc(r.crtc, r.x, r.y, r.mode);
-                    (s.timestamp, (s.width, s.height))
+                    s.timestamp
                 };
-                self.server.input.set_geometry(geom.0, geom.1);
-                self.notify_screen_change();
+                // the framebuffer, the input mapping and the capture positions
+                // all follow the screen model, exactly as for a change the
+                // compositor made
+                self.server.sync_screen(true);
                 self.reply(&randr::SetCrtcConfigReply {
                     status: randr::SetConfig::SUCCESS,
                     sequence: 0,
@@ -935,8 +939,7 @@ impl Connection {
                     .lock()
                     .unwrap()
                     .set_size(r.width, r.height);
-                self.server.input.set_geometry(r.width, r.height);
-                self.notify_screen_change();
+                self.server.sync_screen(true);
             }
             Request::RandrSelectInput(r) => {
                 // We only support ScreenChange; record the window so the event
@@ -1228,14 +1231,6 @@ impl Connection {
         }
     }
 
-    fn notify_screen_change(&self) {
-        let (w, h, t, c) = {
-            let s = self.server.screen.lock().unwrap();
-            (s.width, s.height, s.timestamp, s.config_timestamp)
-        };
-        self.server.events.screen_changed(w, h, t, c);
-    }
-
     /// Asks an X selection owner to convert its selection to UTF8_STRING so we
     /// can offer it on Wayland (X -> Wayland direction).
     fn start_fetch(&mut self, kind: Sel, selection: u32, owner: u32, time: u32) {
@@ -1510,7 +1505,8 @@ fn pick_mime(target: Option<&[u8]>, mimes: &[String]) -> Option<String> {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        self.client.mark_dead();
+        // lets the writer thread send what is queued and exit
+        self.client.close();
     }
 }
 

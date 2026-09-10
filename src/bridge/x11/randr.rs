@@ -225,7 +225,12 @@ impl Screen {
             o.width = w;
             o.height = h;
         }
-        self.recompute_bounds()
+        // a reconfiguration is a new config whether or not the bounds moved
+        let changed = self.recompute_bounds();
+        if !changed {
+            self.bump();
+        }
+        changed
     }
 
     /// Recomputes the X11 screen (i.e., bounding box of all outputs) size for

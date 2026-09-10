@@ -38,11 +38,22 @@ pub(super) struct CursorCap {
     frame: Option<ExtImageCopyCaptureFrameV1>,
     /// Whether the pointer is on this output right now.
     present: bool,
-    /// Hotspot within the cursor image.
+    /// Hotspot within the cursor image. Not the capture buffer's coordinates
+    /// but the cursor's own, upright ones: on a rotated output sway reports
+    /// the arrow's tip, and the tip is where it is after the image below is
+    /// turned upright again.
     hotspot: (i32, i32),
+    /// The transform on the cursor image buffer, from the frame's `transform`
+    /// event. A rotated output's cursor arrives in panel orientation just as
+    /// its screen does (sway sends the output's value here too), so the image
+    /// is turned upright before it goes out over XFixes.
+    frame_transform: Transform,
     /// Hotspot in output-local buffer coordinates, `None` after a leave.
     pos: Option<(i32, i32)>,
     frame_damage: Vec<(i32, i32, i32, i32)>,
+    /// When to ask for a frame again after one failed, since nothing else
+    /// would: the compositor only prompts us on `enter` and `done`.
+    retry_at: Option<Instant>,
 }
 
 impl CursorCap {
@@ -67,8 +78,10 @@ impl CursorCap {
             frame: None,
             present: false,
             hotspot: (0, 0),
+            frame_transform: Transform::Normal,
             pos: None,
             frame_damage: Vec::new(),
+            retry_at: None,
         }
     }
 }
@@ -123,6 +136,42 @@ impl ImageCopyCapture {
             frame.capture();
             cc.frame = Some(frame);
             cc.frame_damage.clear();
+            cc.retry_at = None;
+        }
+    }
+
+    /// The paced part of cursor capture, from [`tick`](super::ImageCopyCapture::tick):
+    /// reopens a cursor session the compositor stopped, and retries a frame
+    /// that failed.
+    pub(super) fn tick_cursors(&mut self, qh: &QueueHandle<State>) {
+        if self.bake_cursor() {
+            return;
+        }
+        let Some(ptr) = self.pointer.clone() else {
+            return;
+        };
+        let cap_mgr = self.cap_mgr.clone();
+        let now = Instant::now();
+        let names: Vec<u32> = self.ctxs.keys().copied().collect();
+        for wl_name in names {
+            let Some(ctx) = self.ctxs.get_mut(&wl_name) else {
+                continue;
+            };
+            match ctx.cursor_cap.as_mut() {
+                None => {
+                    if ctx.cursor_reopen_at.is_some_and(|t| t <= now)
+                        && let Some(source) = &ctx.source
+                    {
+                        ctx.cursor_cap = Some(CursorCap::open(&cap_mgr, source, &ptr, qh, wl_name));
+                        ctx.cursor_reopen_at = None;
+                    }
+                }
+                Some(cc) => {
+                    if cc.frame.is_none() && cc.retry_at.is_some_and(|t| t <= now) {
+                        self.start_cursor_cap_ext(wl_name, qh);
+                    }
+                }
+            }
         }
     }
 
@@ -150,22 +199,34 @@ impl ImageCopyCapture {
             let raw = unsafe { std::slice::from_raw_parts(buf.map as *const u32, pixel_count) };
             // convert each pixel to X cursor ARGB (0xAARRGGBB), forcing the
             // x-formats opaque so an alpha-less cursor isn't fully transparent
-            let image: Vec<u32> = match cc.cap_format.and_then(pixel_layout) {
-                Some(([bi, gi, ri], ai)) => raw
-                    .iter()
-                    .map(|&p| {
+            let argb = |p: u32| -> u32 {
+                match cc.cap_format.and_then(pixel_layout) {
+                    Some(([bi, gi, ri], ai)) => {
                         let by = p.to_le_bytes();
                         let a = ai.map_or(0xff, |i| by[i]);
                         u32::from_be_bytes([a, by[ri], by[gi], by[bi]])
-                    })
-                    .collect(),
-                None => raw.iter().map(|p| p | 0xFF00_0000).collect(),
+                    }
+                    None => p | 0xFF00_0000,
+                }
             };
+            // and turn the image (and the hotspot in it) the way the screen is
+            let t = cc.frame_transform;
+            let (bw, bh) = (buf.width as i32, buf.height as i32);
+            let (tw, th) = t.size(buf.width, buf.height);
+            let mut image = vec![0u32; pixel_count];
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let (dx, dy) = t.point(bx, by, bw, bh);
+                    image[(dy * tw as i32 + dx) as usize] = argb(raw[(by * bw + bx) as usize]);
+                }
+            }
+            // the hotspot already belongs to the upright image (see the field)
+            let (hx, hy) = cc.hotspot;
             self.server.cursor.update_image(
-                buf.width as u16,
-                buf.height as u16,
-                cc.hotspot.0 as u16,
-                cc.hotspot.1 as u16,
+                tw as u16,
+                th as u16,
+                hx.clamp(0, i32::from(u16::MAX)) as u16,
+                hy.clamp(0, i32::from(u16::MAX)) as u16,
                 image,
             )
         };
@@ -180,15 +241,37 @@ impl ImageCopyCapture {
         self.start_cursor_cap_ext(wl_name, qh);
     }
 
-    fn cursor_frame_failed(&mut self, wl_name: u32, frame: &ExtImageCopyCaptureFrameV1) {
-        crate::vlog!("cursor capture frame failed for output {wl_name}");
+    fn cursor_frame_failed(
+        &mut self,
+        wl_name: u32,
+        reason: WEnum<ext_frame_v1::FailureReason>,
+        frame: &ExtImageCopyCaptureFrameV1,
+    ) {
+        let reason_str = match reason {
+            WEnum::Value(ext_frame_v1::FailureReason::BufferConstraints) => "buffer-constraints",
+            WEnum::Value(ext_frame_v1::FailureReason::Stopped) => "session-stopped",
+            _ => "unknown",
+        };
+        crate::vlog!("cursor capture frame failed ({reason_str}) for output {wl_name}");
         if let Some(ctx) = self.ctxs.get_mut(&wl_name)
             && let Some(cc) = ctx.cursor_cap.as_mut()
         {
             cc.frame = None;
-            cc.cap_ready = false;
-            cc.cap_size = None;
-            cc.cap_format = None;
+            // As for the screen path: on buffer-constraints the session has
+            // re-sent (or will re-send) its constraints in its own `done`, so
+            // only the buffer is stale. Resetting readiness here would wait
+            // for a `done` that has already been delivered, and never comes
+            // again, which is how the cursor used to get stuck.
+            if matches!(
+                reason,
+                WEnum::Value(ext_frame_v1::FailureReason::BufferConstraints)
+            ) {
+                cc.buf = None;
+            }
+            // a stopped session is reopened from its own `stopped` event; for
+            // anything else, retry after a pause rather than waiting for the
+            // pointer to leave and re-enter
+            cc.retry_at = Some(Instant::now() + SLOW_INTERVAL);
         }
         frame.destroy();
     }
@@ -221,14 +304,14 @@ impl ImageCopyCapture {
                 }
             }
             Event::Position { x, y } => {
-                // shift the output-local hotspot into virtual-screen coords
-                let root = self
-                    .ctxs
-                    .get(&wl_name)
-                    .map(|ctx| ((ctx.x + x) as i16, (ctx.y + y) as i16));
-                if let Some((rx, ry)) = root {
-                    self.server.cursor.update_position(rx, ry);
-                }
+                // "relative to the main buffer's top left corner in transformed
+                // buffer pixel coordinates": already oriented as on screen, so a
+                // rotated output needs no rotating here, only the shift into
+                // virtual-screen coords
+                let (px, py) = physical_pos(&self.server, wl_name);
+                self.server
+                    .cursor
+                    .update_position((px + x) as i16, (py + y) as i16);
                 if let Some(ctx) = self.ctxs.get_mut(&wl_name)
                     && let Some(cc) = ctx.cursor_cap.as_mut()
                 {
@@ -308,19 +391,15 @@ impl ImageCopyCapture {
                 }
             }
             Event::Stopped => {
-                crate::vlog!("cursor cap session stopped for output {wl_name}");
-                if let Some(ctx) = self.ctxs.get_mut(&wl_name)
-                    && let Some(cc) = ctx.cursor_cap.as_mut()
-                {
-                    if let Some(frame) = cc.frame.take() {
-                        frame.destroy();
-                    }
-                    if let Some(session) = cc.cap_session.take() {
-                        session.destroy();
-                    }
-                    cc.cap_ready = false;
-                    cc.cap_size = None;
-                    cc.cap_format = None;
+                // A stopped session is dead, and `get_capture_session` may only
+                // be sent once per cursor session, so the whole cursor session
+                // goes (the `CursorCap` drop destroys frame, sub-session and
+                // cursor session) and `tick_cursors` opens a fresh one after a
+                // pause.
+                crate::vlog!("cursor capture session stopped for output {wl_name}; will reopen");
+                if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
+                    ctx.cursor_cap = None;
+                    ctx.cursor_reopen_at = Some(Instant::now() + SLOW_INTERVAL);
                 }
             }
             _ => {}
@@ -365,9 +444,17 @@ impl ImageCopyCapture {
                     cc.frame_damage.push((x, y, width, height));
                 }
             }
-            Event::Transform { .. } | Event::PresentationTime { .. } => {}
+            Event::Transform { transform } => {
+                if let WEnum::Value(t) = transform
+                    && let Some(ctx) = self.ctxs.get_mut(&wl_name)
+                    && let Some(cc) = ctx.cursor_cap.as_mut()
+                {
+                    cc.frame_transform = t.into();
+                }
+            }
+            Event::PresentationTime { .. } => {}
             Event::Ready => self.cursor_frame_ready(wl_name, frame, qh),
-            Event::Failed { .. } => self.cursor_frame_failed(wl_name, frame),
+            Event::Failed { reason } => self.cursor_frame_failed(wl_name, reason, frame),
             _ => {}
         }
     }

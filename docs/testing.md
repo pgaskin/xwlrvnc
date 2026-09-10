@@ -15,6 +15,8 @@ And try all of the following:
 
 - multiple outputs
 - scaled outputs
+- rotated and flipped outputs in various layouts
+- scaled outputs, including mixed scales
 - compositor keybinds
 - screen color correctness
 - clipboard paste

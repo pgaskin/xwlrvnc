@@ -29,7 +29,7 @@ unsafe impl Send for ShmBuffer {}
 
 impl Drop for ShmBuffer {
     fn drop(&mut self) {
-        unsafe { nix::libc::munmap(self.map.cast(), self.size) };
+        unsafe { libc::munmap(self.map.cast(), self.size) };
         self.buffer.destroy();
         self.pool.destroy();
     }
@@ -91,27 +91,27 @@ pub(crate) fn create_shm_buffer(
     }
     // SAFETY: the standard memfd_create + ftruncate + mmap dance
     let fd = unsafe {
-        let fd = nix::libc::memfd_create(c"xwlrvnc-capture".as_ptr(), 0);
+        let fd = libc::memfd_create(c"xwlrvnc-capture".as_ptr(), 0);
         if fd < 0 {
             return None;
         }
         let fd = OwnedFd::from_raw_fd(fd);
-        if nix::libc::ftruncate(fd.as_fd().as_raw_fd(), size as nix::libc::off_t) < 0 {
+        if libc::ftruncate(fd.as_fd().as_raw_fd(), size as libc::off_t) < 0 {
             return None;
         }
         fd
     };
     let map = unsafe {
-        nix::libc::mmap(
+        libc::mmap(
             std::ptr::null_mut(),
             size,
-            nix::libc::PROT_READ | nix::libc::PROT_WRITE,
-            nix::libc::MAP_SHARED,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
             fd.as_fd().as_raw_fd(),
             0,
         )
     };
-    if map == nix::libc::MAP_FAILED {
+    if map == libc::MAP_FAILED {
         return None;
     }
     let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());

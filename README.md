@@ -46,6 +46,7 @@ The core VNC features, plus some RealVNC extensions work correctly and have been
       - Supports fractional scaling (if the compositor supports `zxdg_output_manager_v1`).
       - Supports mixed scaling.
     - Supports outputs with different pixel layouts (e.g., Xrgb8888 vs Xbgr8888).
+    - Supports rotated and flipped outputs.
   - Clipboard (both primary and clipboard), including large payloads.
   - Absolute pointer input, including scrolling and extra buttons.
     - Proper mapping for multiple outputs.
@@ -69,6 +70,7 @@ The core VNC features, plus some RealVNC extensions work correctly and have been
   - XDamage support (note that vncagent-x11 will decide whether or not to use it based on a benchmark in the first 6 seconds).
   - It's about as efficient as possible without reading the frame directly when X11 needs it, but there's an extra copy per frame, so the total CPU usage is about 1.5x vncagent-x11 with a real X server.
 - I also stub just enough of the other X11 requests to make the whole UI start up correctly without showing anything.
+- There is no X authentication; instead, only connections from your own user (and root) are accepted.
 
 Some things are out-of scope:
 

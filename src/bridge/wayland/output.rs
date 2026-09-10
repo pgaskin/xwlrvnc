@@ -13,9 +13,12 @@ pub(super) struct OutputAcc {
     pub xdg: Option<ZxdgOutputV1>, // created once the manager is available
     pub x: i32,                    // wl_output geometry position, a scale-1 fallback
     pub y: i32,
-    pub width: i32, // physical mode resolution, from the Mode event
+    pub width: i32, // physical mode resolution, from the Mode event, untransformed
     pub height: i32,
     pub refresh_mhz: i32,
+    /// From the geometry event. The mode (and so the capture buffer) is in the
+    /// panel's native orientation; this is what takes it to the screen.
+    pub transform: Transform,
     /// Integer scale from wl_output, 0 if unset. Only approximates the logical
     /// size when xdg-output is missing; xdg-output is preferred because it
     /// reports the true, possibly fractional, size.
@@ -51,6 +54,10 @@ impl State {
         if acc.width <= 0 || acc.height <= 0 {
             return;
         }
+        // The mode is the panel's native resolution; a rotated output occupies
+        // the transformed size on screen, and that is what the CRTC gets.
+        let transform = acc.transform;
+        let (pw, ph) = transform.size(acc.width as u32, acc.height as u32);
         // The logical rect drives the layout topology, so prefer xdg-output,
         // which is accurate under fractional scaling. Falling back to wl_output
         // geometry and mode/scale is correct for unscaled and integer-scaled
@@ -58,48 +65,29 @@ impl State {
         let scale = acc.scale.max(1);
         let lx = acc.logical_x.unwrap_or(acc.x);
         let ly = acc.logical_y.unwrap_or(acc.y);
-        let lw = acc.logical_width.unwrap_or(acc.width / scale);
-        let lh = acc.logical_height.unwrap_or(acc.height / scale);
-        let (changed, geom, ts) = {
-            let mut s = self.server.screen.lock().unwrap();
-            let changed = s.sync_wayland_output(
-                wl_name,
-                &acc.name,
-                lx,
-                ly,
-                lw,
-                lh,
-                acc.width as u16,
-                acc.height as u16,
-                acc.refresh_mhz.max(0) as u32,
-            );
-            (
-                changed,
-                (s.width, s.height),
-                (s.timestamp, s.config_timestamp),
-            )
-        };
-        self.server
-            .framebuffer
-            .ensure(u32::from(geom.0), u32::from(geom.1));
-        // a relayout can shift other outputs too, so refresh every capture
-        // context from the new layout rather than just this one
-        let positions: Vec<(u32, (i32, i32))> = {
-            let s = self.server.screen.lock().unwrap();
-            // hand the layout to the input path so absolute motion resolves in
-            // logical coordinates, which is what scaling needs
-            self.server.input.set_layout(s.layout_rects());
-            self.capture.positions(&s)
-        };
-        for (n, (px, py)) in positions {
-            self.capture.set_position(n, px, py);
-        }
+        let lw = acc.logical_width.unwrap_or(pw as i32 / scale);
+        let lh = acc.logical_height.unwrap_or(ph as i32 / scale);
+        let changed = self.server.screen.lock().unwrap().sync_wayland_output(
+            wl_name,
+            &acc.name,
+            lx,
+            ly,
+            lw,
+            lh,
+            pw as u16,
+            ph as u16,
+            acc.refresh_mhz.max(0) as u32,
+        );
+        self.capture.set_transform(wl_name, transform);
+        // the capture backends read each output's position from the screen at
+        // blit time, so a relayout that shifts other outputs needs no fan-out
+        let geom = self.server.sync_screen(changed);
         if changed {
-            self.server.input.set_geometry(geom.0, geom.1);
-            self.server
-                .events
-                .screen_changed(geom.0, geom.1, ts.0, ts.1);
-            crate::log!("outputs changed; virtual screen {}x{}", geom.0, geom.1);
+            crate::log!(
+                "outputs changed; virtual screen {}x{}",
+                geom.width,
+                geom.height
+            );
         }
         self.maybe_start_captures(qh);
     }
@@ -107,35 +95,15 @@ impl State {
     pub(super) fn remove_output(&mut self, wl_name: u32) {
         self.outputs.remove(&wl_name);
         self.capture.remove_output(wl_name);
-        let (changed, geom, ts, rects, positions) = {
-            let mut s = self.server.screen.lock().unwrap();
-            let changed = s.remove_wayland_output(wl_name);
-            let rects = s.layout_rects();
-            let positions = self.capture.positions(&s);
-            (
-                changed,
-                (s.width, s.height),
-                (s.timestamp, s.config_timestamp),
-                rects,
-                positions,
-            )
-        };
-        // Removing an output can shrink the screen and shift the rest, so resize
-        // the framebuffer and refresh the survivors' positions and input layout
-        // — the same work apply_output does on add or change.
-        self.server
-            .framebuffer
-            .ensure(u32::from(geom.0), u32::from(geom.1));
-        self.server.input.set_layout(rects);
-        for (n, (px, py)) in positions {
-            self.capture.set_position(n, px, py);
-        }
-        if changed {
-            self.server.input.set_geometry(geom.0, geom.1);
-            self.server
-                .events
-                .screen_changed(geom.0, geom.1, ts.0, ts.1);
-        }
+        // Removing an output can shrink the screen and shift the rest, which
+        // sync_screen propagates the same way it does on add or change.
+        let changed = self
+            .server
+            .screen
+            .lock()
+            .unwrap()
+            .remove_wayland_output(wl_name);
+        self.server.sync_screen(changed);
     }
 }
 
@@ -150,9 +118,14 @@ impl Dispatch<wl_output::WlOutput, u32> for State {
     ) {
         let acc = state.outputs.entry(wl_name).or_default();
         match event {
-            wl_output::Event::Geometry { x, y, .. } => {
+            wl_output::Event::Geometry {
+                x, y, transform, ..
+            } => {
                 acc.x = x;
                 acc.y = y;
+                if let WEnum::Value(t) = transform {
+                    acc.transform = t.into();
+                }
             }
             wl_output::Event::Mode {
                 flags,
@@ -202,6 +175,23 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
             // already drives apply_output); honoured for v1/v2 compositors.
             Event::Done => state.apply_output(wl_name, qh),
             _ => {}
+        }
+    }
+}
+
+impl From<wl_output::Transform> for Transform {
+    fn from(t: wl_output::Transform) -> Self {
+        use wl_output::Transform as T;
+        match t {
+            T::Normal => Self::Normal,
+            T::_90 => Self::Rotate90,
+            T::_180 => Self::Rotate180,
+            T::_270 => Self::Rotate270,
+            T::Flipped => Self::Flipped,
+            T::Flipped90 => Self::Flipped90,
+            T::Flipped180 => Self::Flipped180,
+            T::Flipped270 => Self::Flipped270,
+            _ => Self::Normal,
         }
     }
 }

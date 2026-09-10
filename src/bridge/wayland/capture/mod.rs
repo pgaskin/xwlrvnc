@@ -50,14 +50,6 @@ pub(crate) enum Capture {
 }
 
 impl Capture {
-    fn active(&self) -> Option<&dyn CaptureBackend> {
-        match self {
-            Capture::None => None,
-            Capture::Screencopy(c) => Some(c),
-            Capture::ImageCopy(c) => Some(c),
-        }
-    }
-
     fn active_mut(&mut self) -> Option<&mut dyn CaptureBackend> {
         match self {
             Capture::None => None,
@@ -70,9 +62,9 @@ impl Capture {
         !matches!(self, Capture::None)
     }
 
-    pub(super) fn set_position(&mut self, wl_name: u32, x: i32, y: i32) {
+    pub(super) fn set_transform(&mut self, wl_name: u32, transform: Transform) {
         if let Some(b) = self.active_mut() {
-            b.set_position(wl_name, x, y);
+            b.set_transform(wl_name, transform);
         }
     }
 
@@ -80,15 +72,6 @@ impl Capture {
         if let Some(b) = self.active_mut() {
             b.remove_output(wl_name);
         }
-    }
-
-    pub(super) fn positions(
-        &self,
-        screen: &crate::bridge::x11::randr::Screen,
-    ) -> Vec<(u32, (i32, i32))> {
-        self.active()
-            .map(|b| b.positions(screen))
-            .unwrap_or_default()
     }
 
     /// Records the seat pointer so the ext backend can open cursor sessions,
@@ -104,12 +87,11 @@ impl Capture {
 pub(crate) trait CaptureBackend {
     /// Ensures a capture context exists for every output with a bound proxy.
     fn sync_outputs(&mut self, outputs: &HashMap<u32, OutputAcc>, qh: &QueueHandle<State>);
-    /// Updates an output's physical (virtual-screen) position.
-    fn set_position(&mut self, wl_name: u32, x: i32, y: i32);
+    /// Records the transform the compositor applies to an output's capture
+    /// buffer to put it on screen.
+    fn set_transform(&mut self, wl_name: u32, transform: Transform);
     /// Drops an output's capture context.
     fn remove_output(&mut self, wl_name: u32);
-    /// Each tracked output's physical position from the current layout.
-    fn positions(&self, screen: &crate::bridge::x11::randr::Screen) -> Vec<(u32, (i32, i32))>;
     /// Issues any due captures, returning how long to wait before ticking again.
     fn tick(&mut self, qh: &QueueHandle<State>) -> Duration;
 }
@@ -118,6 +100,18 @@ pub(crate) trait CaptureBackend {
 /// read pixels recently. Nothing is captured otherwise.
 fn capture_enabled(server: &Server) -> bool {
     server.damage.active() || server.framebuffer.read_within(READ_GATE_MS)
+}
+
+/// Where an output's capture lands in the framebuffer, per the current layout.
+/// Read at blit time rather than cached, so a relayout (from the compositor or
+/// from an X client's RandR request) needs no fan-out to the backends.
+fn physical_pos(server: &Server, wl_name: u32) -> (i32, i32) {
+    server
+        .screen
+        .lock()
+        .unwrap()
+        .physical_pos(wl_name)
+        .unwrap_or((0, 0))
 }
 
 /// The fast-cap interval, honouring `-fps`.

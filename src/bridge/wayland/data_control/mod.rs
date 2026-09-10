@@ -95,8 +95,7 @@ impl PendingSend {
         while self.offset < self.data.len() {
             let rest = &self.data[self.offset..];
             // SAFETY: writing `rest.len()` bytes from `rest` to an fd we own
-            let n =
-                unsafe { nix::libc::write(self.fd.as_raw_fd(), rest.as_ptr().cast(), rest.len()) };
+            let n = unsafe { libc::write(self.fd.as_raw_fd(), rest.as_ptr().cast(), rest.len()) };
             if n > 0 {
                 self.offset += n as usize;
                 self.progress_at = Instant::now();
@@ -128,13 +127,9 @@ impl State {
     pub(super) fn queue_send(&mut self, fd: OwnedFd, data: Vec<u8>) {
         // SAFETY: the fd is ours, so O_NONBLOCK on it affects nobody else
         unsafe {
-            let flags = nix::libc::fcntl(fd.as_raw_fd(), nix::libc::F_GETFL);
+            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
             if flags >= 0 {
-                nix::libc::fcntl(
-                    fd.as_raw_fd(),
-                    nix::libc::F_SETFL,
-                    flags | nix::libc::O_NONBLOCK,
-                );
+                libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
         }
         let mut send = PendingSend {

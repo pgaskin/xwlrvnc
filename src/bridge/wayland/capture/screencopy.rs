@@ -18,8 +18,8 @@ use super::*;
 /// One output's capture state.
 struct Ctx {
     output: wl_output::WlOutput,
-    x: i32,
-    y: i32,
+    /// The output's `wl_output` transform, which the frame does not carry.
+    transform: Transform,
     /// The capture that is out, awaiting its `ready`/`failed`. Declared before
     /// `buffer` so a dropped context cancels the copy before destroying the
     /// buffer it copies into.
@@ -93,6 +93,11 @@ impl ScreencopyCapture {
             b.width != w || b.height != h || b.stride != stride || b.format != format
         });
         if stale {
+            crate::vlog!(
+                "screencopy output {wl_name}: {w}x{h} {format:?} stride {stride} y_invert={} transform={:?}",
+                ctx.y_invert,
+                ctx.transform
+            );
             ctx.buffer = create_shm_buffer(&self.shm, qh, format, w, h, stride);
         }
         if let Some(buf) = &ctx.buffer {
@@ -118,15 +123,17 @@ impl ScreencopyCapture {
         if let Some(ctx) = self.ctxs.get(&wl_name)
             && let Some(b) = &ctx.buffer
         {
+            let (x, y) = physical_pos(&self.server, wl_name);
             let slice = unsafe { std::slice::from_raw_parts(b.map, b.size) };
             (bbox, blit_wait, blit_work) = self.server.framebuffer.blit_diff(
-                ctx.x,
-                ctx.y,
+                x,
+                y,
                 b.width,
                 b.height,
                 b.stride,
                 slice,
                 ctx.y_invert,
+                ctx.transform,
                 compute_damage,
                 blit_channels(wl_name, b.format),
             );
@@ -255,21 +262,13 @@ impl CaptureBackend for ScreencopyCapture {
             crate::log!("using zwlr-screencopy-v1 for screen capture");
         }
         for (name, output) in new {
-            // the physical position, if the output has synced; otherwise
-            // apply_output corrects it on the first wl_output `done`
-            let (x, y) = self
-                .server
-                .screen
-                .lock()
-                .unwrap()
-                .physical_pos(name)
-                .unwrap_or((0, 0));
             self.ctxs.insert(
                 name,
                 Ctx {
                     output,
-                    x,
-                    y,
+                    transform: outputs
+                        .get(&name)
+                        .map_or(Transform::Normal, |a| a.transform),
                     frame: None,
                     buffer: None,
                     next_at: now,
@@ -283,22 +282,14 @@ impl CaptureBackend for ScreencopyCapture {
         }
     }
 
-    fn set_position(&mut self, wl_name: u32, x: i32, y: i32) {
+    fn set_transform(&mut self, wl_name: u32, transform: Transform) {
         if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
-            ctx.x = x;
-            ctx.y = y;
+            ctx.transform = transform;
         }
     }
 
     fn remove_output(&mut self, wl_name: u32) {
         self.ctxs.remove(&wl_name);
-    }
-
-    fn positions(&self, screen: &crate::bridge::x11::randr::Screen) -> Vec<(u32, (i32, i32))> {
-        self.ctxs
-            .keys()
-            .filter_map(|&n| screen.physical_pos(n).map(|p| (n, p)))
-            .collect()
     }
 
     fn tick(&mut self, qh: &QueueHandle<State>) -> Duration {

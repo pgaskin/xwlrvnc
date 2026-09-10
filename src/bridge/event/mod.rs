@@ -1,9 +1,10 @@
 //! Server-initiated X events (RandR/XFixes/core notifications), pushed to
 //! clients from background threads — the Wayland output and clipboard thread.
 //!
-//! Every connection registers a [`Client`], whose socket is shared with, and
-//! mutex-guarded against, the connection thread's own replies so concurrent
-//! writes can't interleave.
+//! Every connection registers a [`Client`], which queues everything written
+//! to it (the connection thread's replies and these events alike) for its own
+//! writer thread, so the sequence order is kept and nothing here waits on a
+//! client's socket.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;

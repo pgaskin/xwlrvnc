@@ -31,6 +31,7 @@ use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::Z
 
 use crate::bridge::Server;
 use crate::bridge::clipboard::{self, DataOffer, Sel};
+use crate::util::Transform;
 
 mod capture;
 mod data_control;
@@ -109,7 +110,7 @@ pub fn spawn(server: Arc<Server>) {
         // A manual loop rather than blocking_dispatch, so capture can self-pace:
         // each pass issues whatever is due, then waits on the socket only until
         // the next capture is scheduled.
-        let mut pfds: Vec<nix::libc::pollfd> = Vec::new();
+        let mut pfds: Vec<libc::pollfd> = Vec::new();
         loop {
             if let Err(e) = queue.dispatch_pending(&mut state) {
                 crate::warning!("wayland dispatch failed, continuing: {e}");
@@ -128,22 +129,21 @@ pub fn spawn(server: Arc<Server>) {
                 continue; // events already queued, go dispatch them
             };
             pfds.clear();
-            pfds.push(nix::libc::pollfd {
+            pfds.push(libc::pollfd {
                 fd: guard.connection_fd().as_raw_fd(),
-                events: nix::libc::POLLIN,
+                events: libc::POLLIN,
                 revents: 0,
             });
             // wake as soon as a stalled send's receiver drains its pipe, rather
             // than waiting out the capture interval
-            pfds.extend(state.pending_send_fds().map(|fd| nix::libc::pollfd {
+            pfds.extend(state.pending_send_fds().map(|fd| libc::pollfd {
                 fd,
-                events: nix::libc::POLLOUT,
+                events: libc::POLLOUT,
                 revents: 0,
             }));
             let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-            let n =
-                unsafe { nix::libc::poll(pfds.as_mut_ptr(), pfds.len() as nix::libc::nfds_t, ms) };
-            if n > 0 && pfds[0].revents & nix::libc::POLLIN != 0 {
+            let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
+            if n > 0 && pfds[0].revents & libc::POLLIN != 0 {
                 match guard.read() {
                     Ok(_) => {}
                     Err(wayland_client::backend::WaylandError::Io(e))

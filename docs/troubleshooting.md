@@ -84,7 +84,7 @@ If you're using `ext_image_copy_capture_v1` and see a mesage like `ext capture f
 
 If you see a warning about `client selected events we don't deliver`, it's usually harmless unless your problem is directly related to a listed event.
 
-If you see a message like `unhandled request`, it needs to either be stubbed or implemented in [x11/conn.rs](../src/x11/conn.rs). The client is likely to hang after this since it'll probably be waiting for a reply.
+If you see a message like `unhandled request`, it needs to either be stubbed or implemented in [x11/conn.rs](../src/bridge/x11/conn.rs).
 
 <!-- TODO: I should add a lot more logging, especially around wayland protocol selection -->
 
@@ -106,6 +106,13 @@ TODO: more info
 - Enumerate IPC features to see if there's anything major which might need to be handled.
 - Look at `vncagent-x11` and `vncserver-x11-core`, confirm the X methods, extensions, and events it uses.
 - Test everything.
+
+### Clipboard and atom limitations
+
+The X server does not implement stuff needed for displaying real windows, so some things don't work:
+
+- Atoms and window properties are per connection. Properties set by one client are not visible to other clients. Tools that pass data between clients through root-window properties (or that compare atom values across connections) will not work.
+- `CLIPBOARD` and `PRIMARY` are the only fully functional selection types, and are always fetched by xwlrvnc (as a `UTF8_STRING`) immediately after taken by a client, and published as a wayland selection. Changes to the selection after ownership is taken are not handled. In addition, `SelectionClear` is never sent. This works fine for RealVNC and most other VNC servers.
 
 ### FAQ
 

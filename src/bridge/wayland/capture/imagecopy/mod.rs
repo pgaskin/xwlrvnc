@@ -31,8 +31,12 @@ use cursor::CursorCap;
 /// One output's capture state, screen session and cursor session both.
 struct Ctx {
     output: wl_output::WlOutput,
-    x: i32,
-    y: i32,
+    /// The output's `wl_output` transform, the fallback for frames that carry
+    /// none.
+    transform: Transform,
+    /// From the frame's `transform` event, the same value in the same sense
+    /// as `wl_output` sends (see [`Transform`]); wins over `transform`.
+    frame_transform: Option<Transform>,
     buffer: Option<ShmBuffer>,
     /// The frame awaiting `ready`/`failed`. A session may only have one at a
     /// time (a second `create_frame` is a `duplicate_frame` protocol error), so
@@ -54,8 +58,18 @@ struct Ctx {
     /// Rects from this frame's `damage` events, in buffer coordinates. Converted
     /// to root coordinates before they reach DAMAGE.
     frame_damage: Vec<(i32, i32, i32, i32)>,
-    /// `None` when `-cursor none` bakes the cursor into the screen frames.
+    /// `None` when `-cursor none` bakes the cursor into the screen frames, or
+    /// while a stopped cursor session waits to be reopened.
     cursor_cap: Option<CursorCap>,
+    /// When to reopen the cursor session after the compositor stopped it.
+    cursor_reopen_at: Option<Instant>,
+}
+
+impl Ctx {
+    /// The transform to apply to this output's capture buffer.
+    fn transform(&self) -> Transform {
+        self.frame_transform.unwrap_or(self.transform)
+    }
 }
 
 impl Drop for Ctx {
@@ -119,6 +133,7 @@ impl ImageCopyCapture {
                 && let Some(source) = &ctx.source
             {
                 ctx.cursor_cap = Some(CursorCap::open(&cap_mgr, source, ptr, qh, wl_name));
+                ctx.cursor_reopen_at = None;
             }
         }
     }
@@ -165,7 +180,9 @@ impl ImageCopyCapture {
             ctx.session_ready = false;
             ctx.session_size = None;
             ctx.session_format = None;
+            ctx.frame_transform = None;
             ctx.cursor_cap = cursor_cap;
+            ctx.cursor_reopen_at = None;
             ctx.next_at = Instant::now() + SLOW_INTERVAL; // wait for Done events
         }
     }
@@ -247,41 +264,47 @@ impl ImageCopyCapture {
     ) {
         let compute_damage = self.server.damage.active();
         let (mut blit_wait, mut blit_work) = (0u64, 0u64);
+        let mut compositor_rects: Vec<Rectangle> = Vec::new();
         if let Some(ctx) = self.ctxs.get(&wl_name)
             && let Some(b) = &ctx.buffer
         {
+            let (px, py) = physical_pos(&self.server, wl_name);
+            let transform = ctx.transform();
             let slice = unsafe { std::slice::from_raw_parts(b.map, b.size) };
             // no diff needed, the compositor hands us damage rects directly
             let (_, w, wk) = self.server.framebuffer.blit_diff(
-                ctx.x,
-                ctx.y,
+                px,
+                py,
                 b.width,
                 b.height,
                 b.stride,
                 slice,
                 false,
+                transform,
                 false,
                 blit_channels(wl_name, b.format),
             );
             blit_wait = w;
             blit_work = wk;
-        }
-        // compositor damage is buffer-local, so shift it into virtual-screen coords
-        let compositor_rects: Vec<Rectangle> = if compute_damage {
-            self.ctxs.get(&wl_name).map_or(Vec::new(), |ctx| {
-                ctx.frame_damage
+            // compositor damage is buffer-local: it goes through the same
+            // transform as the pixels, then shifts into virtual-screen coords
+            if compute_damage {
+                let (bw, bh) = (b.width as i32, b.height as i32);
+                compositor_rects = ctx
+                    .frame_damage
                     .iter()
-                    .map(|&(x, y, w, h)| Rectangle {
-                        x: ctx.x as i16 + x as i16,
-                        y: ctx.y as i16 + y as i16,
-                        width: w.max(0) as u16,
-                        height: h.max(0) as u16,
+                    .map(|&r| {
+                        let (x, y, w, h) = transform.rect(r, bw, bh);
+                        Rectangle {
+                            x: (px + x) as i16,
+                            y: (py + y) as i16,
+                            width: w.max(0) as u16,
+                            height: h.max(0) as u16,
+                        }
                     })
-                    .collect()
-            })
-        } else {
-            Vec::new()
-        };
+                    .collect();
+            }
+        }
         let now = Instant::now();
         if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
             ctx.frame = None;
@@ -453,7 +476,16 @@ impl ImageCopyCapture {
                     ctx.frame_damage.push((x, y, width, height));
                 }
             }
-            Event::Transform { .. } | Event::PresentationTime { .. } => {}
+            Event::Transform { transform } => {
+                // the value wl_output sends for the output, in the same sense
+                // (checked against sway); Transform's mapping undoes it
+                if let WEnum::Value(t) = transform
+                    && let Some(ctx) = self.ctxs.get_mut(&wl_name)
+                {
+                    ctx.frame_transform = Some(t.into());
+                }
+            }
+            Event::PresentationTime { .. } => {}
             Event::Ready => self.frame_ready(wl_name, frame, qh),
             Event::Failed { reason } => self.frame_failed(wl_name, reason, frame, qh),
             _ => {}
@@ -473,19 +505,14 @@ impl CaptureBackend for ImageCopyCapture {
             crate::log!("using ext-image-copy-capture-v1 for screen capture");
         }
         for (name, output) in new {
-            let (x, y) = self
-                .server
-                .screen
-                .lock()
-                .unwrap()
-                .physical_pos(name)
-                .unwrap_or((0, 0));
             self.ctxs.insert(
                 name,
                 Ctx {
                     output,
-                    x,
-                    y,
+                    transform: outputs
+                        .get(&name)
+                        .map_or(Transform::Normal, |a| a.transform),
+                    frame_transform: None,
                     buffer: None,
                     frame: None,
                     next_at: now,
@@ -497,6 +524,7 @@ impl CaptureBackend for ImageCopyCapture {
                     session_format: None,
                     frame_damage: Vec::new(),
                     cursor_cap: None,
+                    cursor_reopen_at: None,
                 },
             );
         }
@@ -513,10 +541,9 @@ impl CaptureBackend for ImageCopyCapture {
         }
     }
 
-    fn set_position(&mut self, wl_name: u32, x: i32, y: i32) {
+    fn set_transform(&mut self, wl_name: u32, transform: Transform) {
         if let Some(ctx) = self.ctxs.get_mut(&wl_name) {
-            ctx.x = x;
-            ctx.y = y;
+            ctx.transform = transform;
         }
     }
 
@@ -524,14 +551,8 @@ impl CaptureBackend for ImageCopyCapture {
         self.ctxs.remove(&wl_name);
     }
 
-    fn positions(&self, screen: &crate::bridge::x11::randr::Screen) -> Vec<(u32, (i32, i32))> {
-        self.ctxs
-            .keys()
-            .filter_map(|&n| screen.physical_pos(n).map(|p| (n, p)))
-            .collect()
-    }
-
     fn tick(&mut self, qh: &QueueHandle<State>) -> Duration {
+        self.tick_cursors(qh);
         let now = Instant::now();
         let mut wait = SLOW_INTERVAL;
         let due: Vec<u32> = self
