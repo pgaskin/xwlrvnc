@@ -9,12 +9,15 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 use wayland_client::backend::ObjectId;
 use wayland_client::{Connection, Proxy};
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1::ExtDataControlOfferV1;
 use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_offer_v1::ZwlrDataControlOfferV1;
+use x11rb_protocol::protocol::xproto;
+
+use crate::bridge::event::Client;
 
 /// An offer from either ext-data-control-v1 or zwlr-data-control-v1; the two
 /// expose the same receive/destroy API.
@@ -57,6 +60,38 @@ pub const TEXT_MIMES: &[&str] = &[
     "TEXT",
 ];
 
+/// The X client owning a bridged selection, so we can notify it when it loses
+/// it.
+pub struct XOwner {
+    window: u32,
+    /// The selection atom as interned on that client's connection (our atoms
+    /// are per-connection).
+    atom: u32,
+    client: Weak<Client>,
+}
+
+impl XOwner {
+    pub fn window(&self) -> u32 {
+        self.window
+    }
+
+    pub fn send_clear(&self, timestamp: u32) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        crate::bridge::event::send(
+            &client,
+            &xproto::SelectionClearEvent {
+                response_type: xproto::SELECTION_CLEAR_EVENT,
+                sequence: 0, // stamped by the client's outbox
+                time: timestamp,
+                owner: self.window,
+                selection: self.atom,
+            },
+        );
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Sel {
     Clipboard,
@@ -87,17 +122,34 @@ struct Inner {
     conn: Option<Connection>,
     clipboard: Offered,
     primary: Offered,
-    serial: u32, // bumped on every change, used as the X selection timestamp
+    /// The X timestamp of the last selection change, using the server clock
+    /// (see [`next_timestamp`](Inner::next_timestamp)).
+    last_timestamp: u32,
     x_data: HashMap<Sel, Vec<u8>>, // data X owns and serves to Wayland
-    /// X window owning each bridged selection, if a client does. Server-global,
-    /// since vncagent and vncserverui are separate connections which must agree.
-    x_owner: HashMap<Sel, u32>,
+    /// X client owning each bridged selection, if owned. Server-global (for
+    /// RealVNC, vncagent and vncserverui are separate connections and it must
+    /// be consistent).
+    x_owner: HashMap<Sel, XOwner>,
     /// Published to Wayland, still awaiting the compositor's selection event
     /// for it. See [`take_self_published`](Clipboard::take_self_published).
     self_published: HashSet<Sel>,
 }
 
 impl Inner {
+    /// The X timestamp for the next selection change.
+    ///
+    /// Since clients may compare them, it has to come from the same clock as
+    /// the other timestamps (e.g., the TIMESTAMP target, PropertyNotify).
+    ///
+    /// RealVNC's clipboard remembers the timestamp when it last took the
+    /// selection itself (i.e., when pasting from the viewer) and ignores
+    /// selection changes with an earlier timestamp.
+    fn next_timestamp(&mut self) -> u32 {
+        let ts = crate::bridge::event::server_time_ms().max(self.last_timestamp.wrapping_add(1));
+        self.last_timestamp = ts;
+        ts
+    }
+
     fn sel(&self, sel: Sel) -> &Offered {
         match sel {
             Sel::Clipboard => &self.clipboard,
@@ -119,8 +171,9 @@ impl Clipboard {
         self.inner.lock().unwrap().conn = Some(conn);
     }
 
-    /// Records a new offer, returning the new serial and the offer it replaced
-    /// (which the caller destroys).
+    /// Records a new offer, returning the X timestamp it was acquired at (for
+    /// the TIMESTAMP target and the XFixes notification alike) and the offer it
+    /// replaced (which the caller destroys).
     pub fn set_offer(
         &self,
         sel: Sel,
@@ -128,15 +181,13 @@ impl Clipboard {
         mimes: Vec<String>,
     ) -> (u32, Option<DataOffer>) {
         let mut g = self.inner.lock().unwrap();
-        g.serial = g.serial.wrapping_add(1);
-        let serial = g.serial;
-        let ts = crate::bridge::event::server_time_ms();
+        let ts = g.next_timestamp();
         let slot = g.sel_mut(sel);
         let old = slot.offer.take();
         slot.offer = offer;
         slot.mimes = mimes;
         slot.timestamp = ts;
-        (serial, old)
+        (ts, old)
     }
 
     /// When this selection was last acquired, for the TIMESTAMP target.
@@ -187,20 +238,37 @@ impl Clipboard {
         }
     }
 
-    /// Records the X client owning `sel`.
-    pub fn set_x_owner(&self, sel: Sel, window: u32) {
-        self.inner.lock().unwrap().x_owner.insert(sel, window);
+    /// Records the X client owning `sel`, returning the old owner (which must
+    /// be sent a SelectionClear).
+    pub fn set_x_owner(
+        &self,
+        sel: Sel,
+        window: u32,
+        atom: u32,
+        client: &Arc<Client>,
+    ) -> Option<XOwner> {
+        let owner = XOwner {
+            window,
+            atom,
+            client: Arc::downgrade(client),
+        };
+        self.inner.lock().unwrap().x_owner.insert(sel, owner)
     }
 
-    /// Drops the X owner of `sel`, when it releases the selection or a Wayland
-    /// app takes it.
-    pub fn clear_x_owner(&self, sel: Sel) {
-        self.inner.lock().unwrap().x_owner.remove(&sel);
+    /// Drops the X owner of `sel`, when it releases the selection or Wayland
+    /// takes the selection, returning the owner (so it can be notified).
+    pub fn clear_x_owner(&self, sel: Sel) -> Option<XOwner> {
+        self.inner.lock().unwrap().x_owner.remove(&sel)
     }
 
-    /// The X client owning `sel`, if one does rather than Wayland.
+    /// The window of the X client owning `sel`, if not owned by Wayland.
     pub fn x_owner(&self, sel: Sel) -> Option<u32> {
-        self.inner.lock().unwrap().x_owner.get(&sel).copied()
+        self.inner
+            .lock()
+            .unwrap()
+            .x_owner
+            .get(&sel)
+            .map(XOwner::window)
     }
 
     /// Whether we published `sel` ourselves and have not yet accounted for it,

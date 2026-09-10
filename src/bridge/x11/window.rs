@@ -31,17 +31,9 @@ impl Windows {
     /// This only covers maskable core events (those a client subscribes to via
     /// an event mask) since clients don't explicitly request unmaskable events.
     ///
-    /// We implement the MappingNotify, SelectionRequest and SelectionNotify
-    /// unmaskable events. GraphicsExpose and NoExpose are not relevant since we
-    /// don't actually draw anything. We do not implement SelectionClear.
-    ///
-    /// We don't need SelectionClear because RealVNC gets notified about lost
-    /// selections by XFixesSelectionNotify (both call
-    /// XFixesSelectSelectionInput) and we send that on every Wayland clipboard
-    /// change. It's also complicated to implement correctly since when we
-    /// re-expose the X selection on Wayland, we get notified about our own
-    /// selection, and it's hard to properly tell whether it's from ourself or
-    /// another Wayland client.
+    /// We implement the MappingNotify, SelectionRequest, SelectionNotify and
+    /// SelectionClear unmaskable events. GraphicsExpose and NoExpose are not
+    /// relevant since we don't actually draw anything.
     pub fn warn_unsupported(&mut self, mask: EventMask) {
         let supported = u32::from(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY);
         let unsupported = u32::from(mask) & !supported & !self.warned;

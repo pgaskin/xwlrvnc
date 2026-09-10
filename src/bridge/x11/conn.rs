@@ -262,9 +262,26 @@ impl Connection {
                 // bridged selections are server-global (Wayland can revoke
                 // them), the rest are per-connection
                 let kind = self.selection_kind(r.selection);
+                let time = if r.time == 0 {
+                    crate::bridge::event::server_time_ms()
+                } else {
+                    r.time
+                };
                 match (kind, r.owner) {
-                    (Some(k), 0) => self.server.clipboard.clear_x_owner(k),
-                    (Some(k), owner) => self.server.clipboard.set_x_owner(k, owner),
+                    (Some(k), 0) => {
+                        self.server.clipboard.clear_x_owner(k);
+                    }
+                    (Some(k), owner) => {
+                        let displaced =
+                            self.server
+                                .clipboard
+                                .set_x_owner(k, owner, r.selection, &self.client);
+                        if let Some(prev) = displaced
+                            && prev.window() != owner
+                        {
+                            prev.send_clear(time);
+                        }
+                    }
                     (None, 0) => self.selection.clear_owner(r.selection),
                     (None, owner) => self.selection.set_owner(r.selection, owner),
                 }

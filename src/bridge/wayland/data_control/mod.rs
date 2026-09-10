@@ -239,18 +239,25 @@ impl State {
             .unwrap_or_default();
         // a foreign app taking the selection revokes any X owner, but the
         // compositor announces the source we published through here too
-        if !self.server.clipboard.take_self_published(sel) {
-            self.server.clipboard.clear_x_owner(sel);
-        }
+        let displaced = if self.server.clipboard.take_self_published(sel) {
+            None
+        } else {
+            self.server.clipboard.clear_x_owner(sel)
+        };
         let owner = if offer.is_some() {
             clipboard::OWNER_WINDOW
         } else {
             0
         };
-        let (serial, old) = self.server.clipboard.set_offer(sel, offer, mimes);
+        let (timestamp, old) = self.server.clipboard.set_offer(sel, offer, mimes);
         if let Some(old) = old {
             old.destroy();
         }
-        self.server.events.selection_changed(sel, owner, serial);
+        // tell selection owners about lost selections before sending the XFixes
+        // notification (or it may get ignored)
+        if let Some(prev) = displaced {
+            prev.send_clear(timestamp);
+        }
+        self.server.events.selection_changed(sel, owner, timestamp);
     }
 }
