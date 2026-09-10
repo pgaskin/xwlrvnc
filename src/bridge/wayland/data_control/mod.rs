@@ -185,7 +185,9 @@ impl State {
         if matches!(self.device, Some(DataDevice::Ext(_))) {
             return;
         }
-        let Some(seat) = &self.seat else { return };
+        let Some(seat) = &self.clipboard_seat else {
+            return;
+        };
 
         if let Some(mgr) = &self.ext_manager {
             // ext is preferred, so replace any wlr device we already made

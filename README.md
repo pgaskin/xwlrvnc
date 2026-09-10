@@ -55,6 +55,8 @@ The core VNC features, plus some RealVNC extensions work correctly and have been
     - Proper mapping for scaled outputs.
   - Keyboard input, including modifier keys and keybindings.
   - Client-side cursor (if the compositor supports `ext_image_copy_capture_v1`).
+  - Optionally use a transient seat (if the compositor supports `ext_transient_seat_v1`).
+  - Automatically wake the display (if the compositor supports `zwlr_output_power_manager_v1`).
 - Protocol extensions:
   - Multi-monitor output selection.
   - Audio, via the detected pulse socket and cookie.
@@ -121,6 +123,10 @@ The following wayland protocols are used. At least one in each category is requi
   - [`ext_image_copy_capture_v1`](https://wayland.app/protocols/ext-image-copy-capture-v1)
 - Output configuration, for dynamic resolution (optional, only with `-dynres`, see `-outmgr`)
   - [`zwlr_output_manager_v1`](https://wayland.app/protocols/wlr-output-management-unstable-v1)
+- Output power (optional)
+  - [`zwlr_output_power_manager_v1`](https://wayland.app/protocols/wlr-output-power-management-unstable-v1)
+- Transient seat (optional, only with `-seat transient`, clipboard is always on the first seat)
+  - [`ext_transient_seat_v1`](https://wayland.app/protocols/ext-transient-seat-v1)
 
 If your compositor is has a broken/missing virtual keyboard/pointer implementation (e.g., Smithay-based ones like niri), you'll need to wrap xwlrvnc with [wl-uinput-proxy](https://github.com/pgaskin/wl-uinput-proxy) to work around it using uinput.
 
@@ -132,7 +138,6 @@ I'll probably add support for other capture/input protocols later, and maybe als
   - Refactor everything and clean up Claude's mess (almost done, just need to go over everything again)
 
 - Future
-  - See if we can make input work on headless compositors with no existing seats.
   - Maybe make a launcher script and systemd unit for RealVNC.
   - Support input via `libei`.
   - Maybe support capture via `xdg-desktop-portal`.

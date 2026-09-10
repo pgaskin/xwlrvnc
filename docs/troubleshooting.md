@@ -14,6 +14,10 @@ If you're using a Smithay-based compositor and compositor keybindings don't work
 
 If your compositor does not implement a supported virtual input protocol, you can use [wl-uinput-proxy](https://github.com/pgaskin/wl-uinput-proxy) for that too. 
 
+By default, the virtual input devices go on the first seat (or the one named by `-seat`). With `-seat transient`, xwlrvnc asks the compositor for a seat of its own using `ext_transient_seat_v1`, so remote input has its own cursor and keyboard focus (the clipboard stays on the first real seat, since selections are per-seat). If the compositor doesn't support it or denies it, xwlrvnc logs a warning and uses the first seat instead. This does not apply with wl-uinput-proxy, since uinput devices always go to the compositor's own seat.
+
+If the local display is asleep (e.g., swayidle turned it off), the compositor can't capture it, and clients see a frozen screen. If the compositor supports `zwlr_output_power_manager_v1` (selected with `-pwrmgr`, default `auto`), xwlrvnc turns an output back on when a client starts watching the screen, and again if it goes off while one is watching. It never turns outputs off.
+
 KDE and GNOME are not currently supported since they prefer to use [`org.freedesktop.portal.RemoteDesktop`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html) via [xdg-desktop-protocol](https://flatpak.github.io/xdg-desktop-portal/), which uses [PipeWire](https://pipewire.org/) for screen capture and [libei](https://libinput.pages.freedesktop.org/libei/) for virtual input.
 
 ### Ensuring the X server works with Xlib

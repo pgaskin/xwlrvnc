@@ -5,8 +5,10 @@
 //! relevant `try_init_*`/`maybe_start_*`, each of which no-ops until everything
 //! it needs is present.
 
+use wayland_protocols::ext::transient_seat::v1::client::ext_transient_seat_manager_v1::ExtTransientSeatManagerV1;
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 use wayland_protocols_wlr::output_management::v1::client::zwlr_output_manager_v1::ZwlrOutputManagerV1;
+use wayland_protocols_wlr::output_power_management::v1::client::zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1;
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 
 use super::*;
@@ -47,6 +49,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, name);
                     state.outputs.entry(name).or_default().proxy = Some(output);
                     state.ensure_xdg_output(name, qh);
+                    state.ensure_output_power(name, qh);
                 } else if interface == ZxdgOutputManagerV1::interface().name {
                     state.xdg_output_mgr = Some(bind(registry, name, version, 3, qh));
                     let names: Vec<u32> = state.outputs.keys().copied().collect();
@@ -74,14 +77,21 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 } else if interface == wl_seat::WlSeat::interface().name {
                     let seat =
                         registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(9), qh, name);
-                    if config.seat.is_none() {
-                        // no -seat, so take the first one we see
-                        if state.seat.is_none() {
-                            state.select_seat(name, seat, conn, qh);
-                        }
-                    } else {
-                        // wait for the seat's `name` event to match -seat NAME
-                        state.pending_seats.insert(name, seat);
+                    state.seat_announced(name, seat, conn, qh);
+                } else if interface == ExtTransientSeatManagerV1::interface().name {
+                    state.has_transient_mgr = true;
+                    if matches!(state.seat_mode, SeatMode::Transient) {
+                        let mgr: ExtTransientSeatManagerV1 = bind(registry, name, version, 1, qh);
+                        state.bind_transient_seat_manager(mgr, qh);
+                    }
+                } else if interface == ZwlrOutputPowerManagerV1::interface().name
+                    && config.pwrmgr.wants_wlr()
+                {
+                    state.power_mgr = Some(bind(registry, name, version, 1, qh));
+                    crate::log!("using zwlr-output-power-management-v1 to wake sleeping outputs");
+                    let names: Vec<u32> = state.outputs.keys().copied().collect();
+                    for n in names {
+                        state.ensure_output_power(n, qh);
                     }
                 } else if interface == ExtDataControlManagerV1::interface().name
                     && config.clipboard.wants_ext()
@@ -112,6 +122,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             }
             wl_registry::Event::GlobalRemove { name } if state.outputs.contains_key(&name) => {
                 state.remove_output(name);
+            }
+            wl_registry::Event::GlobalRemove { name } if state.transient_global() == Some(name) => {
+                state.transient_seat_removed();
             }
             _ => {}
         }

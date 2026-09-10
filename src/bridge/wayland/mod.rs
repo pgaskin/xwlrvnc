@@ -27,10 +27,12 @@ use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_captu
 use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::{self, ZxdgOutputV1};
 use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1;
+use wayland_protocols_wlr::output_power_management::v1::client::zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 
 use crate::bridge::Server;
 use crate::bridge::clipboard::{self, DataOffer, Sel};
+use crate::config::SeatChoice;
 use crate::util::Transform;
 
 mod capture;
@@ -38,14 +40,18 @@ mod data_control;
 mod input;
 mod output;
 mod output_config;
+mod output_power;
 mod registry;
 mod shm;
+mod transient_seat;
 use capture::Capture;
 use data_control::{DataDevice, PendingSend};
 use input::{KeyboardBackend, PointerBackend};
 use output::OutputAcc;
 use output_config::OutputConfig;
+use output_power::OutputPower;
 use shm::{ShmBuffer, blit_channels, channel_map, create_shm_buffer, pixel_layout};
+use transient_seat::TransientSeat;
 
 /// Connects and synchronously reads the initial output geometry, so the X server
 /// reports the real size before the wrapped binary starts, then dispatches on a
@@ -65,12 +71,22 @@ pub fn spawn(server: Arc<Server>) {
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
 
+    let seat_mode = match server.config.seat_choice() {
+        SeatChoice::First => SeatMode::First,
+        SeatChoice::Named(n) => SeatMode::Named(n.to_string()),
+        SeatChoice::Transient => SeatMode::Transient,
+    };
     let mut state = State {
         server,
         outputs: HashMap::new(),
         xdg_output_mgr: None,
+        seat_mode,
         seat: None,
+        clipboard_seat: None,
+        transient: None,
+        has_transient_mgr: false,
         pending_seats: HashMap::new(),
+        seat_names: HashMap::new(),
         seat_caps: HashMap::new(),
         keyboard: None,
         pointer: None,
@@ -92,6 +108,7 @@ pub fn spawn(server: Arc<Server>) {
         vkbd_keymap: None,
         keymap_hash: None,
         output_config: None,
+        power_mgr: None,
     };
 
     // settle the registry globals, and the events they trigger, before the
@@ -106,6 +123,8 @@ pub fn spawn(server: Arc<Server>) {
         if i == 0 {
             state.registry_settled = true;
             state.maybe_start_captures(&qh);
+            state.transient_seat_settled(&conn, &qh);
+            state.output_power_settled();
             if state.server.config.outmgr_wants_wlr() && state.output_config.is_none() {
                 crate::warning!(
                     "dynamic resolution is unavailable: the compositor has no \
@@ -114,6 +133,9 @@ pub fn spawn(server: Arc<Server>) {
             }
         }
     }
+    // the seats and their names have all landed by now; say so if none was
+    // usable rather than leave input silently dead
+    state.warn_if_no_seat();
     let wake_fd = state.server.dynres.wake_fd();
 
     std::thread::spawn(move || {
@@ -192,10 +214,28 @@ struct State {
     /// Learns each output's logical position and size, for laying scaled outputs
     /// out correctly.
     xdg_output_mgr: Option<ZxdgOutputManagerV1>,
+    /// How the input seat is chosen; reverts to `First` if a transient seat
+    /// cannot be had.
+    seat_mode: SeatMode,
+    /// The seat the virtual input devices go on, and whose keymap and pointer
+    /// (for cursor sessions) we follow.
     seat: Option<wl_seat::WlSeat>,
-    /// Seats bound but not chosen, held alive for their `name` event while we
-    /// wait to match `-seat NAME`. Keyed by registry name.
+    /// The seat the clipboard follows. The same as `seat`, except with
+    /// `-seat transient`, where it is the first real seat: selections are per
+    /// seat, and the apps on screen use the real one.
+    clipboard_seat: Option<wl_seat::WlSeat>,
+    /// The transient seat request, with `-seat transient`.
+    transient: Option<TransientSeat>,
+    /// Whether the compositor advertised `ext_transient_seat_manager_v1`,
+    /// whether or not we bound it, for the hint when no seat is usable.
+    has_transient_mgr: bool,
+    /// Seats bound but not chosen, held alive while we wait for the one to
+    /// select (its `name` event for `-seat NAME`, or the transient seat's
+    /// `ready`). Keyed by registry name.
     pending_seats: HashMap<u32, wl_seat::WlSeat>,
+    /// The `name` of every bound seat, keyed by registry name, for the
+    /// message when `-seat NAME` matches none of them.
+    seat_names: HashMap<u32, String>,
     /// The last `capabilities` from every bound seat, keyed by registry name.
     /// Kept for the ones not yet chosen, since the event may land before the
     /// `name` that selects the seat.
@@ -226,6 +266,9 @@ struct State {
     /// The wlr-output-management client, bound only with `-dynres`, through
     /// which clients' resolution changes reach the compositor.
     output_config: Option<OutputConfig>,
+    /// Wakes outputs the compositor put to sleep while a client is watching;
+    /// see [`output_power`].
+    power_mgr: Option<ZwlrOutputPowerManagerV1>,
     /// Hash of the last keymap text loaded, to ignore re-broadcasts. Forwarding a
     /// keymap to our virtual keyboard makes the compositor re-emit it to our
     /// passive wl_keyboard (sway does, when we're the only input device), and
@@ -234,7 +277,74 @@ struct State {
     keymap_hash: Option<u64>,
 }
 
+/// See [`SeatChoice`]; owned, since the state outlives the config borrow.
+enum SeatMode {
+    First,
+    Named(String),
+    Transient,
+}
+
 impl State {
+    /// A `wl_seat` global arrived (already bound as `seat`): select it, or hold
+    /// it until we know whether it is the one.
+    fn seat_announced(
+        &mut self,
+        name: u32,
+        seat: wl_seat::WlSeat,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match self.seat_mode {
+            // take the first one we see
+            SeatMode::First => {
+                if self.seat.is_none() {
+                    self.select_seat(name, seat, conn, qh);
+                }
+            }
+            // wait for the seat's `name` event to match -seat NAME
+            SeatMode::Named(_) => {
+                self.pending_seats.insert(name, seat);
+            }
+            // wait for the transient seat's `ready` to name its global
+            SeatMode::Transient => {
+                self.pending_seats.insert(name, seat);
+                self.transient_seat_announced(name, conn, qh);
+            }
+        }
+    }
+
+    /// After setup: no seat was selected, so input will not work. A transient
+    /// seat is still on its way at this point (its own path warns if that
+    /// fails), so only the modes that wait on the compositor's seats speak.
+    fn warn_if_no_seat(&self) {
+        if self.seat.is_some() {
+            return;
+        }
+        let hint = if self.has_transient_mgr {
+            " (try -seat transient)"
+        } else {
+            ""
+        };
+        match &self.seat_mode {
+            SeatMode::First => {
+                crate::warning!("the compositor has no wl_seat; input is disabled{hint}");
+            }
+            SeatMode::Named(wanted) => {
+                let mut names: Vec<&str> = self.seat_names.values().map(String::as_str).collect();
+                names.sort_unstable();
+                let names = if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(", ")
+                };
+                crate::warning!(
+                    "no wayland seat named {wanted:?} (seats: {names}); input is disabled{hint}"
+                );
+            }
+            SeatMode::Transient => {}
+        }
+    }
+
     /// The compositor is gone: nothing will answer a resolution change any
     /// more, so fail the one in progress and make the X side refuse the rest
     /// outright rather than wait out its timeout each time.
@@ -243,10 +353,11 @@ impl State {
         self.server.dynres.set_available(false);
     }
 
-    /// Commits to a seat, wiring up clipboard and virtual input, and creating
-    /// its passive keyboard (for the keymap) and pointer (for cursor sessions)
-    /// for whatever capabilities it has announced so far. Any other pending
-    /// seats are dropped.
+    /// Commits to a seat for input, wiring up virtual input and creating its
+    /// passive keyboard (for the keymap) and pointer (for cursor sessions) for
+    /// whatever capabilities it has announced so far. The clipboard follows it
+    /// too unless a seat was already chosen for that. Any other pending seats
+    /// are dropped.
     fn select_seat(
         &mut self,
         name: u32,
@@ -254,6 +365,9 @@ impl State {
         conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        if self.clipboard_seat.is_none() {
+            self.clipboard_seat = Some(seat.clone());
+        }
         self.seat = Some(seat);
         self.pending_seats.clear();
         self.try_init_device(conn, qh);
@@ -304,11 +418,13 @@ impl Dispatch<wl_seat::WlSeat, u32> for State {
             }
             // the name matters for matching -seat NAME; once a seat is chosen
             // the rest are dropped and this no-ops
-            wl_seat::Event::Name { name: seat_name }
-                if state.seat.is_none()
-                    && state.server.config.seat.as_deref() == Some(seat_name.as_str()) =>
-            {
-                if let Some(seat) = state.pending_seats.remove(&name) {
+            wl_seat::Event::Name { name: seat_name } => {
+                let wanted = matches!(&state.seat_mode, SeatMode::Named(n) if *n == seat_name);
+                state.seat_names.insert(name, seat_name.clone());
+                if wanted
+                    && state.seat.is_none()
+                    && let Some(seat) = state.pending_seats.remove(&name)
+                {
                     crate::log!("using wayland seat {seat_name:?}");
                     state.select_seat(name, seat, conn, qh);
                 }

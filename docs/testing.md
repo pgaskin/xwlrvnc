@@ -27,6 +27,8 @@ And try all of the following:
 - different pixel formats
 - adding/removing/changing outputs while connected
 - pausing and resuming capture for idle clients
+- transient seats
+- output power
 - dynamic resolution (`-dynres`, see [troubleshooting](./troubleshooting.md#dynamic-resolution))
   - from RealVNC (with the hook), including the viewer's doubled request and a request for the current size
   - from `xrandr` (`--newmode`/`--addmode`/`--mode`, `--off`/`--auto`, `--fb`)

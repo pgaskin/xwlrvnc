@@ -11,7 +11,7 @@ define_config! {
         display: Option<u32> = value("number"),
         /// write the display number to this fd once the server is ready
         displayfd: Option<u32> = value("fd"),
-        /// screen capture protocol.
+        /// screen capture protocol
         screen: ScreenType = choice("auto"),
         /// clipboard protocol
         clipboard: ClipboardType = choice("auto"),
@@ -19,8 +19,10 @@ define_config! {
         outmgr: OutMgrType = choice("auto"),
         /// cursor source (if none, it's baked into the screen capture)
         cursor: CursorType = choice("auto"),
-        /// use the wayland seat with this name
-        seat: Option<String> = value("name"),
+        /// output power management protocol (used to wake the screen while capturing)
+        pwrmgr: PwrMgrType = choice("auto"),
+        /// use the wayland seat with this name, or create a transient one
+        seat: Option<String> = value("name|transient"),
         /// fallback screen size before outputs are known
         geometry: Option<Geometry> = value("WxH"),
         /// cap the screen capture frame rate (default is optimized for vncagent-x11)
@@ -80,6 +82,18 @@ impl ArgEnum for OutMgrType {
     }
 }
 
+impl ArgEnum for PwrMgrType {
+    const VARIANTS: &'static [&'static str] = &["auto", "none", "wlr"];
+    fn from_arg(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "none" => Self::None,
+            "wlr" => Self::Wlr,
+            _ => return None,
+        })
+    }
+}
+
 impl ArgEnum for ClipboardType {
     const VARIANTS: &'static [&'static str] = &["auto", "none", "wlr", "ext"];
     fn from_arg(s: &str) -> Option<Self> {
@@ -122,7 +136,27 @@ pub enum OutMgrType {
     Wlr,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PwrMgrType {
+    Auto,
+    None,
+    Wlr,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeatChoice<'a> {
+    First,
+    Named(&'a str),
+    Transient,
+}
+
 impl OutMgrType {
+    pub fn wants_wlr(self) -> bool {
+        matches!(self, Self::Auto | Self::Wlr)
+    }
+}
+
+impl PwrMgrType {
     pub fn wants_wlr(self) -> bool {
         matches!(self, Self::Auto | Self::Wlr)
     }
@@ -149,6 +183,16 @@ impl ClipboardType {
 impl Config {
     pub fn damage(&self) -> bool {
         !self.nodamage
+    }
+
+    /// The `-seat` option, decoded. The literal `transient` asks for a seat of
+    /// our own rather than one called that.
+    pub fn seat_choice(&self) -> SeatChoice<'_> {
+        match self.seat.as_deref() {
+            None => SeatChoice::First,
+            Some(s) if s.eq_ignore_ascii_case("transient") => SeatChoice::Transient,
+            Some(s) => SeatChoice::Named(s),
+        }
     }
 
     /// Whether to bind wlr-output-management: dynamic resolution is on, and the

@@ -177,6 +177,11 @@ impl State {
                 "screen capture {}",
                 if enabled { "started" } else { "stopped" }
             );
+            // a client just started watching; a sleeping output would give it
+            // nothing but capture failures
+            if enabled {
+                self.wake_outputs("screen capture started");
+            }
         }
         if !enabled {
             return DISABLED_INTERVAL;

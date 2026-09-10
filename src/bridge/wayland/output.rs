@@ -11,6 +11,7 @@ use super::*;
 pub(super) struct OutputAcc {
     pub proxy: Option<wl_output::WlOutput>,
     pub xdg: Option<ZxdgOutputV1>, // created once the manager is available
+    pub power: Option<OutputPower>, // likewise, with -pwrmgr
     pub x: i32,                    // wl_output geometry position, a scale-1 fallback
     pub y: i32,
     pub width: i32, // physical mode resolution, from the Mode event, untransformed
@@ -95,7 +96,9 @@ impl State {
     }
 
     pub(super) fn remove_output(&mut self, wl_name: u32) {
-        self.outputs.remove(&wl_name);
+        if let Some(mut acc) = self.outputs.remove(&wl_name) {
+            Self::drop_output_power(&mut acc);
+        }
         self.capture.remove_output(wl_name);
         self.dynres_output_removed(wl_name);
         // Removing an output can shrink the screen and shift the rest, which
