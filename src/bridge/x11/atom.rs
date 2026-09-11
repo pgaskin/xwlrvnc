@@ -1,8 +1,13 @@
 use std::collections::HashMap;
 
-/// Per-connection table of interned atoms pre-initialized with the ones from
+/// The server's table of interned atoms, pre-initialized with the ones from
 /// `Xatom.h` (this is required for protocol compatibility).
-pub(super) struct Atoms {
+///
+/// One table for the whole server, as in X: `dix/atom.c` interns into a single
+/// global table, and clients rely on it — the atom `vncagent` gets for
+/// `CLIPBOARD` has to be the one `vncserverui` gets, or a selection named
+/// across two connections is two different selections.
+pub(crate) struct Atoms {
     by_name: HashMap<Vec<u8>, u32>,
     by_id: HashMap<u32, Vec<u8>>,
     next: u32,
@@ -25,6 +30,9 @@ static PREDEFINED_ATOMS: &[&str] = &[ // 1-indexed atoms
     "POINT_SIZE", "RESOLUTION", "COPYRIGHT", "NOTICE", "FONT_NAME",
     "FAMILY_NAME", "FULL_NAME", "CAP_HEIGHT", "WM_CLASS", "WM_TRANSIENT_FOR",
 ];
+
+/// `PRIMARY`, the first predefined atom (`Xatom.h`).
+pub const XA_PRIMARY: u32 = 1;
 
 pub const XA_INTEGER: u32 = 19;
 

@@ -141,12 +141,12 @@ TODO: more info
 - Look at `vncagent-x11` and `vncserver-x11-core`, confirm the X methods, extensions, and events it uses.
 - Test everything.
 
-### Clipboard and atom limitations
+### Clipboard and window property limitations
 
 The X server does not implement stuff needed for displaying real windows, so some things don't work:
 
-- Atoms and window properties are per connection. Properties set by one client are not visible to other clients. Tools that pass data between clients through root-window properties (or that compare atom values across connections) will not work.
-- `CLIPBOARD` and `PRIMARY` are the only fully functional selection types, and are always fetched by xwlrvnc (as a `UTF8_STRING`) immediately after taken by a client, and published as a wayland selection. Changes to the selection after ownership is taken are not handled. In addition, `SelectionClear` is never sent. This works fine for RealVNC and most other VNC servers.
+- Window properties are per connection. Properties set by one client are not visible to other clients. Tools that pass data between clients through root-window properties (cut buffers, `RESOURCE_MANAGER`) will not work.
+- `CLIPBOARD` and `PRIMARY` are the only fully functional selection types, and are always fetched by xwlrvnc (as a `UTF8_STRING`) immediately after taken by a client, and published as a wayland selection. Changes to the selection after ownership is taken are not handled. This works fine for RealVNC and most other VNC servers.
 
 ### FAQ
 

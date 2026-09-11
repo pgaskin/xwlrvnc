@@ -1,6 +1,7 @@
 use std::io::{self, BufReader, Read};
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use x11rb_protocol::RawFdContainer;
 use x11rb_protocol::protocol::Request;
@@ -11,20 +12,24 @@ use x11rb_protocol::protocol::xproto::{
 use x11rb_protocol::protocol::{bigreq, damage, randr, render, shm, xfixes, xproto, xtest};
 use x11rb_protocol::x11_utils::{RequestHeader, Serialize, TryParse};
 
-use super::atom::Atoms;
 use super::mit_shm::Shm;
 use super::property::{Properties, Property};
-use super::selection::{IncrStep, Selection};
+use super::selection::{Fetch, IncrStep, Selection};
+use super::targets;
 use super::window::Windows;
 use super::xfixes::Regions;
 use super::{ROOT_COLORMAP, ROOT_DEPTH, ROOT_VISUAL, ROOT_WINDOW};
 use crate::bridge::Server;
-use crate::bridge::clipboard::Sel;
+use crate::bridge::clipboard::{Sel, Take, Value};
+use crate::bridge::clipjobs::{Job, PendingConversion};
 use crate::bridge::event::Client;
-use crate::bridge::x11::atom::XA_INTEGER;
+use crate::bridge::x11::atom::{XA_INTEGER, XA_PRIMARY};
 use crate::bridge::x11::ext::EXTENSIONS;
 use crate::bridge::x11::randr as randr_screen;
 use crate::bridge::x11::{CLIENT_RESOURCE_ID_BASE, SELECTION_FETCH_WINDOW};
+
+/// How many property names the fetch ring cycles through.
+const FETCH_PROPERTIES: u32 = 4;
 use crate::util::{Geometry, bbox, mm};
 
 /// The largest request we accept, in 4-byte units including the header, as
@@ -38,6 +43,15 @@ const MAX_REQUEST_LENGTH: u32 = 4_194_303;
 /// failure rather than a hang.
 const DYNRES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// What answering one `ConvertSelection` came to.
+enum Fill {
+    /// The answer is ready: reply naming this property, or 0 to refuse.
+    Now(u32),
+    /// The value is on its way out of a Wayland app; the requestor is answered
+    /// by the job fetching it, not here.
+    Later,
+}
+
 pub struct Connection {
     reader: BufReader<UnixStream>,
     client: Arc<Client>,
@@ -46,11 +60,21 @@ pub struct Connection {
     id: u32,
     /// Current request sequence number.
     seq: u16,
-    atoms: Atoms,
     /// Stored window properties for fake windows (i.e., clipboard/WM).
-    properties: Properties,
-    /// Clipboard/selection state machine (owners, in-flight fetch, INCR receive).
+    ///
+    /// Still per connection — one client's properties are not another's, which
+    /// is what RealVNC's clipboard expects (`docs/troubleshooting.md`) — but
+    /// behind a lock and an `Arc`, because a conversion answered out of a
+    /// Wayland app finishes on the Wayland thread and has to store its result
+    /// somewhere the connection thread will read it, possibly after the
+    /// connection itself has gone.
+    properties: Arc<Mutex<Properties>>,
+    /// Clipboard/selection state machine (owners, in-flight fetches, INCR).
     selection: Selection,
+    /// Cycles the property name each fetch uses, so an answer can be told from
+    /// a stale one. A small ring rather than a fresh atom per fetch: atoms are
+    /// interned for the life of the connection and never freed.
+    fetch_seq: u32,
     /// MIT-SHM segments the client attached, for ShmGetImage.
     shm: Shm,
     /// XFixes regions (rectangle lists), keyed by region id.
@@ -71,9 +95,9 @@ impl Connection {
             server,
             id,
             seq: 0,
-            atoms: Atoms::default(),
-            properties: Properties::default(),
+            properties: Arc::default(),
             selection: Selection::default(),
+            fetch_seq: 0,
             shm: Shm::default(),
             regions: Regions::default(),
             windows: Windows::default(),
@@ -84,7 +108,7 @@ impl Connection {
         self.handshake()?;
         // only now: an event fanned out from another thread before the setup
         // bytes were queued would land ahead of them on the wire
-        self.server.events.register(self.client.clone());
+        self.server.events.register(&self.client);
         while let Some(raw) = read_request(&mut self.reader)? {
             self.seq = self.seq.wrapping_add(1);
             self.client.set_seq(self.seq);
@@ -148,7 +172,12 @@ impl Connection {
         match req {
             // --- atoms ---
             Request::InternAtom(r) => {
-                let atom = self.atoms.intern(&r.name, r.only_if_exists);
+                let atom = self
+                    .server
+                    .atoms
+                    .lock()
+                    .unwrap()
+                    .intern(&r.name, r.only_if_exists);
                 self.reply(&xproto::InternAtomReply {
                     sequence: 0,
                     length: 0,
@@ -156,7 +185,17 @@ impl Connection {
                 })?;
             }
             Request::GetAtomName(r) => {
-                let name = self.atoms.name(r.atom).unwrap_or(b"").to_vec();
+                // an atom nobody interned is BadAtom, as in dix: answering
+                // with an empty name instead makes a client walking the table
+                // (xlsatoms does) walk it forever
+                let Some(name) = self.atom_name(r.atom) else {
+                    return self.send_error_value(
+                        xproto::ATOM_ERROR,
+                        r.atom,
+                        major,
+                        u16::from(minor),
+                    );
+                };
                 self.reply(&xproto::GetAtomNameReply {
                     sequence: 0,
                     length: 0,
@@ -202,10 +241,8 @@ impl Connection {
                 // an empty write signals completion. We ack each by deleting the
                 // property (which notifies the owner to send the next chunk).
                 if self.selection.incr_chunk(r.window, r.property) {
-                    match self.selection.incr_push(r.data.into_owned()) {
-                        IncrStep::Done(kind, data) => {
-                            self.server.clipboard.offer_to_wayland(kind, data)
-                        }
+                    match self.selection.incr_push(r.property, r.data.into_owned()) {
+                        IncrStep::Done(fetch, data) => self.fetched(fetch, Some(data)),
                         IncrStep::More(property) => self.property_notify(
                             SELECTION_FETCH_WINDOW,
                             property,
@@ -219,28 +256,32 @@ impl Connection {
                     format: r.format,
                     data: r.data.into_owned(),
                 };
-                // Prepend/Append extend an existing value, which must agree on
-                // type and format (BadMatch otherwise); on a missing property
-                // they behave as Replace.
-                if r.mode != xproto::PropMode::REPLACE
-                    && let Some(old) = self.properties.get(r.window, r.property)
                 {
-                    if old.type_ != value.type_ || old.format != value.format {
-                        return self.send_error(xproto::MATCH_ERROR, major, u16::from(minor));
+                    let mut properties = self.properties.lock().unwrap();
+                    // Prepend/Append extend an existing value, which must agree
+                    // on type and format (BadMatch otherwise); on a missing
+                    // property they behave as Replace.
+                    if r.mode != xproto::PropMode::REPLACE
+                        && let Some(old) = properties.get(r.window, r.property)
+                    {
+                        if old.type_ != value.type_ || old.format != value.format {
+                            drop(properties);
+                            return self.send_error(xproto::MATCH_ERROR, major, u16::from(minor));
+                        }
+                        if r.mode == xproto::PropMode::APPEND {
+                            let mut data = old.data.clone();
+                            data.append(&mut value.data);
+                            value.data = data;
+                        } else {
+                            value.data.extend_from_slice(&old.data);
+                        }
                     }
-                    if r.mode == xproto::PropMode::APPEND {
-                        let mut data = old.data.clone();
-                        data.append(&mut value.data);
-                        value.data = data;
-                    } else {
-                        value.data.extend_from_slice(&old.data);
-                    }
+                    properties.set(r.window, r.property, value);
                 }
-                self.properties.set(r.window, r.property, value);
                 self.property_notify(r.window, r.property, xproto::Property::NEW_VALUE);
             }
             Request::DeleteProperty(r) => {
-                self.properties.remove(r.window, r.property);
+                self.properties.lock().unwrap().remove(r.window, r.property);
                 self.property_notify(r.window, r.property, xproto::Property::DELETE);
             }
             Request::GetProperty(r) => {
@@ -251,7 +292,7 @@ impl Connection {
                 }
             }
             Request::ListProperties(r) => {
-                let atoms = self.properties.list(r.window);
+                let atoms = self.properties.lock().unwrap().list(r.window);
                 self.reply(&xproto::ListPropertiesReply {
                     sequence: 0,
                     length: 0,
@@ -267,41 +308,54 @@ impl Connection {
                 } else {
                     r.time
                 };
+                crate::cliplog!(
+                    "SetSelectionOwner {kind:?} owner {:#x} time {time}",
+                    r.owner,
+                );
+                // X drops a request from the future, or from before the
+                // selection last changed, without a word: the client believes
+                // it owns the selection until it asks
+                let stale = || {
+                    crate::cliplog!("SetSelectionOwner at {time} is stale; ignored");
+                    Ok(())
+                };
                 match (kind, r.owner) {
-                    (Some(k), 0) => {
-                        self.server.clipboard.clear_x_owner(k);
-                    }
+                    // a bridged selection: the clipboard state machine makes
+                    // the transition and hands back the events it calls for
+                    (Some(k), 0) => match self.server.clipboard.x_released(k, time) {
+                        Take::Took(effects) => effects.apply(&self.server, k),
+                        Take::Stale => return stale(),
+                    },
                     (Some(k), owner) => {
-                        let displaced =
-                            self.server
-                                .clipboard
-                                .set_x_owner(k, owner, r.selection, &self.client);
-                        if let Some(prev) = displaced
-                            && prev.window() != owner
-                        {
-                            prev.send_clear(time);
+                        match self.server.clipboard.x_took(k, owner, &self.client, time) {
+                            Take::Took(effects) => {
+                                effects.apply(&self.server, k);
+                                if owner == crate::bridge::clipboard::OWNER_WINDOW {
+                                    // our own synthetic window: there is nothing to
+                                    // ask for its value, so nothing to wait for
+                                    self.selection_owner_notify(kind, r.selection, owner, time);
+                                } else {
+                                    // pull its value into Wayland; watchers hear of
+                                    // the acquisition once that resolves (`fetched`)
+                                    self.start_fetch(k, r.selection, owner, time);
+                                }
+                            }
+                            Take::Stale => return stale(),
                         }
                     }
-                    (None, 0) => self.selection.clear_owner(r.selection),
-                    (None, owner) => self.selection.set_owner(r.selection, owner),
-                }
-                // A real X client took ownership: pull its data into Wayland.
-                if r.owner != 0
-                    && r.owner != crate::bridge::clipboard::OWNER_WINDOW
-                    && let Some(kind) = kind
-                {
-                    self.start_fetch(kind, r.selection, r.owner, r.time);
+                    // one we don't bridge: this connection's own owner table,
+                    // and only this connection's watchers hear about it
+                    (None, owner) => {
+                        if !self.selection.set_owner(r.selection, owner, time) {
+                            return stale();
+                        }
+                        self.selection_owner_notify(kind, r.selection, owner, time);
+                    }
                 }
             }
             Request::GetSelectionOwner(r) => {
-                // An X client owner wins; otherwise we own it if Wayland has it.
                 let owner = match self.selection_kind(r.selection) {
-                    Some(k) => self.server.clipboard.x_owner(k).or_else(|| {
-                        self.server
-                            .clipboard
-                            .has(k)
-                            .then_some(crate::bridge::clipboard::OWNER_WINDOW)
-                    }),
+                    Some(k) => self.server.clipboard.owner_window(k),
                     None => self.selection.owner(r.selection),
                 };
                 self.reply(&xproto::GetSelectionOwnerReply {
@@ -313,13 +367,26 @@ impl Connection {
             Request::ConvertSelection(r) => self.convert_selection(&r)?,
             Request::SendEvent(r) => self.handle_send_event(&r.event),
             Request::XfixesSelectSelectionInput(r) => {
-                if let Some(kind) = self.selection_kind(r.selection) {
-                    let enable = r
-                        .event_mask
-                        .contains(xfixes::SelectionEventMask::SET_SELECTION_OWNER);
-                    self.client
-                        .select_selection(kind, r.selection, r.window, enable);
+                let known = xfixes::SelectionEventMask::SET_SELECTION_OWNER
+                    | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+                    | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE;
+                let mask = u32::from(r.event_mask);
+                if mask & !u32::from(known) != 0 {
+                    return self.send_error_value(
+                        xproto::VALUE_ERROR,
+                        mask,
+                        major,
+                        u16::from(minor),
+                    );
                 }
+                let kind = self.selection_kind(r.selection);
+                crate::cliplog!(
+                    "SelectSelectionInput window {:#x} {kind:?} (atom {}) mask {mask:#x}",
+                    r.window,
+                    r.selection,
+                );
+                self.client
+                    .select_selection(r.selection, r.window, r.event_mask);
             }
 
             // --- window/drawable queries (we have no real windows) ---
@@ -1138,6 +1205,26 @@ impl Connection {
             }
             Request::DestroyWindow(r) => {
                 self.windows.remove(r.window);
+                // and with it its XFixes registrations and any selection it
+                // owned, which reverts to nobody
+                self.client.forget_window(r.window);
+                for (atom, last_changed) in self.selection.forget_window(r.window) {
+                    let regs = self
+                        .client
+                        .selections_for(atom, xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY);
+                    crate::bridge::event::selection_notify(
+                        &self.client,
+                        &regs,
+                        xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY,
+                        0,
+                        crate::bridge::event::server_time_ms(),
+                        last_changed,
+                    );
+                }
+                self.selection_owner_gone(
+                    Some(r.window),
+                    xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY,
+                );
             }
             Request::XfixesSelectCursorInput(r) => {
                 let want = u32::from(r.event_mask)
@@ -1205,7 +1292,8 @@ impl Connection {
             value_len: 0,
             value: vec![],
         };
-        let Some(p) = self.properties.get(r.window, r.property) else {
+        let mut properties = self.properties.lock().unwrap();
+        let Some(p) = properties.get(r.window, r.property) else {
             return (empty, false);
         };
         // a type mismatch (with a specific type asked for) reports what the
@@ -1237,7 +1325,7 @@ impl Connection {
         };
         let deleted = r.delete && bytes_after == 0;
         if deleted {
-            self.properties.remove(r.window, r.property);
+            properties.remove(r.window, r.property);
         }
         (reply, deleted)
     }
@@ -1403,12 +1491,46 @@ impl Connection {
         }
     }
 
+    /// Interns an atom in the server's table (`InternAtom` with
+    /// `only_if_exists` false).
+    fn intern(&self, name: &[u8]) -> u32 {
+        self.server.atoms.lock().unwrap().intern(name, false)
+    }
+
+    /// The name of an interned atom, copied out rather than borrowed: the
+    /// table is shared, so the lock cannot be held while we use it.
+    fn atom_name(&self, atom: u32) -> Option<Vec<u8>> {
+        self.server
+            .atoms
+            .lock()
+            .unwrap()
+            .name(atom)
+            .map(<[u8]>::to_vec)
+    }
+
     /// Asks an X selection owner to convert its selection to UTF8_STRING so we
     /// can offer it on Wayland (X -> Wayland direction).
     fn start_fetch(&mut self, kind: Sel, selection: u32, owner: u32, time: u32) {
-        let target = self.atoms.intern(b"UTF8_STRING", false);
-        let property = self.atoms.intern(b"XWLRVNC_FETCH", false);
-        self.selection.begin_fetch(kind, property);
+        let target = self.intern(b"UTF8_STRING");
+        // one property per fetch, so transfers in flight at the same time
+        // (RealVNC starts PRIMARY and CLIPBOARD at once) cannot land on top of
+        // each other, INCR chunks included, and an answer can be matched to the
+        // request it belongs to
+        let which = match kind {
+            Sel::Clipboard => "CLIPBOARD",
+            Sel::Primary => "PRIMARY",
+        };
+        self.fetch_seq = self.fetch_seq.wrapping_add(1) % FETCH_PROPERTIES;
+        let name = format!("XWLRVNC_FETCH_{which}_{}", self.fetch_seq);
+        let property = self.intern(name.as_bytes());
+        crate::cliplog!("ConvertSelection {kind:?} to owner {owner:#x} time {time}");
+        self.selection.begin_fetch(Fetch {
+            kind,
+            selection,
+            property,
+            owner,
+            time,
+        });
         let request = xproto::SelectionRequestEvent {
             response_type: xproto::SELECTION_REQUEST_EVENT,
             sequence: self.seq,
@@ -1434,40 +1556,70 @@ impl Connection {
         if notify.requestor != SELECTION_FETCH_WINDOW {
             return;
         }
-        let Some((kind, fetch_property)) = self.selection.take_fetch() else {
+        // matched by selection: PRIMARY and CLIPBOARD replies are both in
+        // flight, and answering the wrong one hands a selection the other's text
+        let Some(fetch) = self.selection.take_fetch(notify.selection, notify.property) else {
+            crate::cliplog!(
+                "SelectionNotify for selection {} answers no fetch",
+                notify.selection
+            );
             return;
         };
-        if notify.property == 0 {
+        let kind = fetch.kind;
+        // property 0 is a refusal
+        if notify.property != fetch.property {
+            crate::cliplog!("{kind:?} owner refused the conversion");
+            self.fetched(fetch, None);
             return;
         }
         let Some(p) = self
             .properties
-            .remove(SELECTION_FETCH_WINDOW, fetch_property)
+            .lock()
+            .unwrap()
+            .remove(SELECTION_FETCH_WINDOW, fetch.property)
         else {
+            crate::cliplog!("{kind:?} owner answered but stored no value");
+            self.fetched(fetch, None);
             return;
         };
-        if self.atoms.name(p.type_) == Some(b"INCR") {
+        if self.atom_name(p.type_).as_deref() == Some(b"INCR") {
             // Large value: the owner will feed it in chunks. Per ICCCM, the
             // requestor starts the transfer by deleting the INCR property
             // (which the owner, watching this window, reacts to with the first
             // chunk).
-            self.selection.begin_incr(kind, fetch_property);
+            self.selection.begin_incr(fetch);
             self.property_notify(
                 SELECTION_FETCH_WINDOW,
-                fetch_property,
+                fetch.property,
                 xproto::Property::DELETE,
             );
         } else {
-            self.server.clipboard.offer_to_wayland(kind, p.data);
+            self.fetched(fetch, Some(p.data));
+        }
+    }
+
+    /// A fetch resolved: the owner gave us `data`, or with `None` would not.
+    /// Either way, if that owner is still current, XFixes watchers now hear
+    /// of its acquisition — with its window and the time it used, as X would
+    /// have told them at `SetSelectionOwner`. Not before: X forwards their
+    /// conversions to the owner, while we answer them from what we fetched,
+    /// so the news is only good once there is something to fetch.
+    fn fetched(&self, fetch: Fetch, data: Option<Vec<u8>>) {
+        let clipboard = &self.server.clipboard;
+        let effects = match data {
+            Some(data) => clipboard.x_fetched(fetch.kind, fetch.owner, fetch.time, data),
+            None => clipboard.x_fetch_failed(fetch.kind, fetch.owner, fetch.time),
+        };
+        if let Some(effects) = effects {
+            effects.apply(&self.server, fetch.kind);
         }
     }
 
     /// Maps an X selection atom to the Wayland selection it bridges.
     fn selection_kind(&self, atom: u32) -> Option<Sel> {
-        let kind = match self.atoms.name(atom) {
-            _ if atom == 1 => Some(Sel::Primary), // PRIMARY (predefined)
+        let kind = match self.atom_name(atom).as_deref() {
+            _ if atom == XA_PRIMARY => Some(Sel::Primary), // predefined
             Some(b"CLIPBOARD") => Some(Sel::Clipboard),
-            Some(b"PRIMARY") => Some(Sel::Primary),
             _ => None,
         };
         // With -noprimary, treat PRIMARY as an unknown selection so we neither
@@ -1478,39 +1630,62 @@ impl Connection {
         kind
     }
 
-    /// Handles ConvertSelection for a Wayland-backed selection: fills the
-    /// requestor's property from the clipboard and replies with SelectionNotify.
+    /// Handles ConvertSelection for a bridged selection: fills the requestor's
+    /// property from the clipboard and replies with SelectionNotify — unless
+    /// the value has to come out of a Wayland app, in which case the requestor
+    /// is answered when it does, and this connection goes back to serving
+    /// requests in the meantime.
     fn convert_selection(&mut self, r: &xproto::ConvertSelectionRequest) -> io::Result<()> {
+        // any selection request is a chance to notice conversions the Wayland
+        // thread has stopped answering; the client waiting on one of those is
+        // by definition not asking us anything else
+        self.server.clipboard.jobs().sweep();
         let kind = self.selection_kind(r.selection);
-        let owned = kind.is_some_and(|k| self.server.clipboard.has(k));
-        let property = if owned {
-            self.fill_selection(kind.unwrap(), r.target, r.requestor, r.property)
+        // an X owner's value is ours to serve from the moment it took the
+        // selection, before the compositor has echoed what we published for it
+        let owned = kind.is_some_and(|k| self.server.clipboard.owner_window(k).is_some());
+        let filled = if owned {
+            self.fill_selection(kind.unwrap(), r)
         } else {
-            0 // we don't own it / can't convert
+            Fill::Now(0) // we don't own it / can't convert
         };
-        let notify = xproto::SelectionNotifyEvent {
+        let Fill::Now(property) = filled else {
+            return Ok(());
+        };
+        let notify = self.selection_notify(r, property);
+        self.send_event(&notify);
+        Ok(())
+    }
+
+    /// The `SelectionNotify` answering `r`, refusing it with `property` 0.
+    fn selection_notify(
+        &self,
+        r: &xproto::ConvertSelectionRequest,
+        property: u32,
+    ) -> xproto::SelectionNotifyEvent {
+        xproto::SelectionNotifyEvent {
             response_type: xproto::SELECTION_NOTIFY_EVENT,
-            sequence: self.seq,
+            sequence: self.seq, // stamped by the client's outbox
             time: r.time,
             requestor: r.requestor,
             selection: r.selection,
             target: r.target,
             property,
-        };
-        self.send_event(&notify);
-        Ok(())
+        }
     }
 
-    /// Stores the converted selection data as a property, returning the property
-    /// atom on success or 0 on failure.
-    fn fill_selection(&mut self, kind: Sel, target: u32, requestor: u32, property: u32) -> u32 {
-        let target_name = self.atoms.name(target).map(<[u8]>::to_vec);
+    /// Answers one conversion of `kind`: stores the value as the requestor's
+    /// property and names it, refuses with 0, or hands the request to the
+    /// Wayland thread and leaves it to answer.
+    fn fill_selection(&mut self, kind: Sel, r: &xproto::ConvertSelectionRequest) -> Fill {
+        let (requestor, property) = (r.requestor, r.property);
+        let target_name = self.atom_name(r.target);
         if target_name.as_deref() == Some(b"TIMESTAMP") {
             // ICCCM: reply with the time this selection was acquired, as a single
             // 32-bit INTEGER. Polling clients (vncagent) convert TIMESTAMP and
             // re-read only when it changes.
-            let ts = self.server.clipboard.timestamp(kind);
-            self.properties.set(
+            let ts = self.server.clipboard.last_changed(kind);
+            self.properties.lock().unwrap().set(
                 requestor,
                 property,
                 Property {
@@ -1519,7 +1694,7 @@ impl Connection {
                     data: ts.to_le_bytes().to_vec(),
                 },
             );
-            return property;
+            return Fill::Now(property);
         }
         if target_name.as_deref() == Some(b"TARGETS") {
             let targets = self.supported_targets(kind);
@@ -1527,7 +1702,7 @@ impl Connection {
             for a in targets {
                 data.extend_from_slice(&a.to_le_bytes());
             }
-            self.properties.set(
+            self.properties.lock().unwrap().set(
                 requestor,
                 property,
                 Property {
@@ -1536,66 +1711,169 @@ impl Connection {
                     data,
                 },
             );
-            return property;
+            return Fill::Now(property);
         }
-        let mimes = self.selection_mimes(kind);
-        let Some(mime) = pick_mime(target_name.as_deref(), &mimes) else {
-            return 0;
+        let (mimes, generation) = self.server.clipboard.convertible(kind);
+        let Some(conv) = targets::resolve(target_name.as_deref().unwrap_or(b""), &mimes) else {
+            return Fill::Now(0);
         };
-        // an X owner's bytes are already here, and reading them back out of the
-        // compositor would round-trip into our own source: blocking this thread
-        // on the Wayland one, and serving the previous selection until the
-        // compositor announces the new one
-        let data = match self.server.clipboard.x_owner(kind) {
-            Some(_) => Some(self.server.clipboard.x_data(kind)),
-            None => self.server.clipboard.read(kind, &mime),
+        let type_ = match conv.type_ {
+            Some(name) => self.intern(name),
+            None => r.target,
         };
-        match data {
-            Some(data) if !data.is_empty() => {
-                self.properties.set(
+        match self.server.clipboard.value(kind) {
+            Value::None => Fill::Now(0),
+            Value::Here(data) => {
+                Self::store_converted(
+                    &self.properties,
                     requestor,
                     property,
-                    Property {
-                        type_: target,
-                        format: 8,
-                        data,
-                    },
+                    type_,
+                    conv.latin1,
+                    data,
                 );
-                property
+                Fill::Now(property)
             }
-            _other => 0,
+            // out of a Wayland app, down a pipe only the Wayland thread may
+            // ask for and read: this thread posts the job and moves on, and
+            // the job answers the requestor whenever the app gets round to it
+            // (or is dropped, which refuses it)
+            Value::FromWayland => {
+                let conversion = self.pending_conversion(r, type_, conv.latin1);
+                crate::cliplog!(
+                    "ConvertSelection {kind:?} to {} for window {requestor:#x}: asking the app",
+                    conv.mime,
+                );
+                self.server.clipboard.jobs().post(Job::Receive {
+                    sel: kind,
+                    mime: conv.mime,
+                    generation,
+                    since: Instant::now(),
+                    conversion,
+                });
+                Fill::Later
+            }
         }
     }
 
-    /// The mime types `kind` can be converted to. While an X client owns it,
-    /// the ones we advertise on its behalf: the stored offer is still the
-    /// previous one until the compositor announces the source we published.
-    fn selection_mimes(&self, kind: Sel) -> Vec<String> {
-        if self.server.clipboard.x_owner(kind).is_some() {
-            return crate::bridge::clipboard::TEXT_MIMES
-                .iter()
-                .map(|m| (*m).to_string())
-                .collect();
-        }
-        self.server.clipboard.mimes(kind)
+    /// Stores a converted value as the requestor's property, transcoding it
+    /// first if the target is one that asked for Latin-1. An empty value is a
+    /// value: X selections can be empty, and refusing one would leave the
+    /// requestor's previous paste in place.
+    ///
+    /// The properties lock is a leaf: nothing else is ever taken while it is
+    /// held, on this thread or the Wayland one.
+    fn store_converted(
+        properties: &Mutex<Properties>,
+        requestor: u32,
+        property: u32,
+        type_: u32,
+        latin1: bool,
+        data: Vec<u8>,
+    ) {
+        let data = if latin1 {
+            targets::to_latin1(&data)
+        } else {
+            data
+        };
+        // never `unwrap`: this runs from a refusal in `Drop`, which the
+        // `Draining` guard puts on every panic path, and panicking on a
+        // poisoned lock during unwinding aborts the whole server. A poisoned
+        // `Properties` still stores correctly.
+        properties
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set(
+                requestor,
+                property,
+                Property {
+                    type_,
+                    format: 8,
+                    data,
+                },
+            );
+    }
+
+    /// The half of a conversion that runs once a Wayland app has handed over
+    /// its value (or would not): store the property, then tell the requestor.
+    /// That order is the one the requestor reads them in — it asks for the
+    /// property only after the notification — and both happen on the thread
+    /// that finished the transfer, so nothing can interleave between them.
+    ///
+    /// It carries the property store and the client rather than the connection
+    /// because it may well outlive it: this thread goes straight back to
+    /// serving requests, and may have finished with the client altogether by
+    /// the time the value arrives. The property goes to *this* connection's
+    /// store, exactly as it does when the answer is immediate; properties are
+    /// per connection, so a requestor window belonging to another connection
+    /// is out of reach either way.
+    fn pending_conversion(
+        &self,
+        r: &xproto::ConvertSelectionRequest,
+        type_: u32,
+        latin1: bool,
+    ) -> PendingConversion {
+        pending_conversion(
+            self.properties.clone(),
+            &self.client,
+            self.selection_notify(r, r.property),
+            type_,
+            latin1,
+        )
     }
 
     /// The list of target atoms we can convert the given selection to.
     fn supported_targets(&mut self, kind: Sel) -> Vec<u32> {
-        let mimes = self.selection_mimes(kind);
-        let mut out = vec![
-            self.atoms.intern(b"TARGETS", false),
-            self.atoms.intern(b"TIMESTAMP", false),
-        ];
-        if mimes.iter().any(|m| m.starts_with("text/")) {
-            out.push(self.atoms.intern(b"UTF8_STRING", false));
-            out.push(self.atoms.intern(b"STRING", false));
-            out.push(self.atoms.intern(b"TEXT", false));
-        }
-        for m in &mimes {
-            out.push(self.atoms.intern(m.as_bytes(), false));
+        let mimes = self.server.clipboard.mimes(kind);
+        let mut out = vec![self.intern(b"TARGETS"), self.intern(b"TIMESTAMP")];
+        for name in targets::advertised(&mimes) {
+            out.push(self.intern(&name));
         }
         out
+    }
+
+    /// XFixesSelectionNotify for an accepted `SetSelectionOwner` on
+    /// `selection` that starts no fetch: to every client if it is bridged,
+    /// else to this one alone.
+    fn selection_owner_notify(&self, kind: Option<Sel>, selection: u32, owner: u32, time: u32) {
+        let subtype = xfixes::SelectionEvent::SET_SELECTION_OWNER;
+        let now = crate::bridge::event::server_time_ms();
+        match kind {
+            Some(k) => self.server.events.selection_changed(
+                k,
+                self.server.selection_atom(k),
+                subtype,
+                owner,
+                now,
+                time,
+            ),
+            None => {
+                let regs = self.client.selections_for(selection, subtype);
+                crate::bridge::event::selection_notify(
+                    &self.client,
+                    &regs,
+                    subtype,
+                    owner,
+                    now,
+                    time,
+                );
+            }
+        }
+    }
+
+    /// Reverts every bridged selection this client owns (from `window`, if
+    /// given) to no owner, telling XFixes watchers with `subtype`; X does the
+    /// same when the owner window is destroyed or its client goes.
+    fn selection_owner_gone(&self, window: Option<u32>, subtype: xfixes::SelectionEvent) {
+        for kind in [Sel::Clipboard, Sel::Primary] {
+            if let Some(effects) =
+                self.server
+                    .clipboard
+                    .x_owner_gone(kind, &self.client, window, subtype)
+            {
+                effects.apply(&self.server, kind);
+            }
+        }
     }
 
     /// Sends a PropertyNotify for `(window, atom)` if the window selected
@@ -1637,41 +1915,20 @@ impl Connection {
     /// implement; for a reply-expecting request the error takes the reply's
     /// place so the client unblocks. The sequence is stamped by `send_reply`.
     fn send_error(&self, code: u8, major: u8, minor: u16) -> io::Result<()> {
+        self.send_error_value(code, 0, major, minor)
+    }
+
+    /// [`send_error`](Self::send_error) with the offending value filled in,
+    /// for the errors that name one (`BadValue`, `BadAtom`, ...).
+    fn send_error_value(&self, code: u8, value: u32, major: u8, minor: u16) -> io::Result<()> {
         // 32-byte X error: [0]=0 (error), [1]=code, [2..4]=sequence (stamped by
-        // send_reply), [4..8]=bad value (0), [8..10]=minor opcode, [10]=major.
+        // send_reply), [4..8]=bad value, [8..10]=minor opcode, [10]=major.
         let mut buf = [0u8; 32];
         buf[1] = code;
+        buf[4..8].copy_from_slice(&value.to_le_bytes());
         buf[8..10].copy_from_slice(&minor.to_le_bytes());
         buf[10] = major;
         self.client.send_reply(self.seq, &mut buf)
-    }
-}
-
-/// Picks a Wayland mime type to satisfy an X conversion target.
-fn pick_mime(target: Option<&[u8]>, mimes: &[String]) -> Option<String> {
-    let has = |m: &str| mimes.iter().any(|x| x == m);
-    let first_text = || mimes.iter().find(|m| m.starts_with("text/")).cloned();
-    match target {
-        Some(b"UTF8_STRING") => {
-            if has("text/plain;charset=utf-8") {
-                Some("text/plain;charset=utf-8".into())
-            } else {
-                first_text()
-            }
-        }
-        Some(b"STRING") | Some(b"TEXT") => {
-            if has("text/plain") {
-                Some("text/plain".into())
-            } else {
-                first_text()
-            }
-        }
-        // a raw mime type used directly as the target
-        Some(other) if other.contains(&b'/') => {
-            let mime = String::from_utf8_lossy(other).into_owned();
-            has(&mime).then_some(mime)
-        }
-        _ => None,
     }
 }
 
@@ -1679,7 +1936,48 @@ impl Drop for Connection {
     fn drop(&mut self) {
         // lets the writer thread send what is queued and exit
         self.client.close();
+        // X reverts a closing client's selections to nobody; the rest of the
+        // display hears about it, this client no longer can
+        self.selection_owner_gone(None, xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE);
     }
+}
+
+/// See [`Connection::pending_conversion`]; free of the connection so that it
+/// can outlive it, and so that it can be tested without one.
+fn pending_conversion(
+    properties: Arc<Mutex<Properties>>,
+    client: &Arc<Client>,
+    notify: xproto::SelectionNotifyEvent,
+    type_: u32,
+    latin1: bool,
+) -> PendingConversion {
+    let (requestor, property) = (notify.requestor, notify.property);
+    // Weak, for the reason [`EventSink::clients`] is: a `Client` owns a
+    // duplicate of the connection's socket, so holding it strongly would keep
+    // that descriptor open for a connection that has already gone, for as long
+    // as the conversion has left to run. If it is gone there is nobody to answer.
+    let client = Arc::downgrade(client);
+    PendingConversion::new(move |data| {
+        let Some(client) = client.upgrade() else {
+            return;
+        };
+        // A refusal runs from `Drop`, including while unwinding a panic, and
+        // the `Draining` guard makes that a path every panic takes. Panicking
+        // on a poisoned lock there would be a panic inside a drop during
+        // unwinding, which aborts the whole server — every client, not just
+        // this one. A poisoned `Properties` still answers `insert` correctly;
+        // carrying on with it beats taking the process down.
+        let mut notify = notify;
+        match data {
+            Some(data) => {
+                Connection::store_converted(&properties, requestor, property, type_, latin1, data);
+            }
+            // no value to be had: a refusal, as from an owner that cannot
+            // convert to the target it was asked for
+            None => notify.property = 0,
+        }
+        crate::bridge::event::send(&client, &notify);
+    })
 }
 
 pub struct RawRequest {
@@ -1938,4 +2236,145 @@ static DEFAULT_MODIFIER_MAP: [u8; 16] = [
 
 fn pad4(n: usize) -> usize {
     (n + 3) & !3
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    use x11rb_protocol::x11_utils::TryParse;
+
+    use super::*;
+
+    const REQUESTOR: u32 = 0x0060_0005;
+    const PROPERTY: u32 = 321;
+    const TYPE: u32 = 654;
+
+    /// A conversion answered later, as one out of a Wayland app is, plus the
+    /// property store it writes to and the socket its client reads.
+    fn pending(latin1: bool) -> (PendingConversion, Arc<Mutex<Properties>>, UnixStream) {
+        let (peer, ours) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let properties: Arc<Mutex<Properties>> = Arc::default();
+        let notify = xproto::SelectionNotifyEvent {
+            response_type: xproto::SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: 42,
+            requestor: REQUESTOR,
+            selection: 1,
+            target: 7,
+            property: PROPERTY,
+        };
+        let client = Client::new(ours).unwrap();
+        let c = pending_conversion(properties.clone(), &client, notify, TYPE, latin1);
+        (c, properties, peer)
+    }
+
+    /// The `SelectionNotify` the client was sent, once its writer thread has
+    /// got to it.
+    fn notified(peer: &mut UnixStream) -> xproto::SelectionNotifyEvent {
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("no event was sent");
+        let (notify, _) = xproto::SelectionNotifyEvent::try_parse(&buf[..]).unwrap();
+        notify
+    }
+
+    #[test]
+    fn a_finished_conversion_stores_the_property_then_notifies() {
+        // the requestor reads them in that order — it asks for the property
+        // only once the notification names it — so the value has to be there
+        // by the time the event goes out
+        let (c, properties, mut peer) = pending(false);
+        c.finish(Some(b"hello".to_vec()));
+        let notify = notified(&mut peer);
+        assert_eq!(notify.property, PROPERTY, "the property is named");
+        assert_eq!(notify.requestor, REQUESTOR);
+        let p = properties.lock().unwrap();
+        let p = p.get(REQUESTOR, PROPERTY).expect("stored before the event");
+        assert_eq!(p.data, b"hello");
+        assert_eq!((p.type_, p.format), (TYPE, 8));
+    }
+
+    #[test]
+    fn a_refused_conversion_names_no_property() {
+        let (c, properties, mut peer) = pending(false);
+        c.finish(None);
+        assert_eq!(notified(&mut peer).property, 0, "0 is the refusal");
+        assert!(
+            properties
+                .lock()
+                .unwrap()
+                .get(REQUESTOR, PROPERTY)
+                .is_none(),
+            "and nothing is left behind for the requestor to read"
+        );
+    }
+
+    #[test]
+    fn a_latin1_target_is_transcoded_on_the_way_out() {
+        let (c, properties, mut peer) = pending(true);
+        c.finish(Some("é".as_bytes().to_vec()));
+        assert_eq!(notified(&mut peer).property, PROPERTY);
+        let p = properties.lock().unwrap();
+        assert_eq!(p.get(REQUESTOR, PROPERTY).unwrap().data, [0xe9]);
+    }
+
+    #[test]
+    fn a_conversion_nobody_finishes_refuses_the_requestor() {
+        // a job dropped on a full queue, or with no wayland thread to run it
+        let (c, _properties, mut peer) = pending(false);
+        drop(c);
+        assert_eq!(notified(&mut peer).property, 0);
+    }
+
+    #[test]
+    fn answering_a_connection_that_has_gone_does_nothing() {
+        // A conversion holds the client weakly, so that it cannot keep the
+        // duplicate socket of a dead connection open. Once the connection and
+        // its writer thread are done there is nobody to answer, so the late
+        // value is dropped rather than stored: the property belongs to a
+        // connection that no longer exists to read it.
+        let (peer, ours) = UnixStream::pair().unwrap();
+        let properties: Arc<Mutex<Properties>> = Arc::default();
+        let client = Client::new(ours).unwrap();
+        let gone = Arc::downgrade(&client);
+        let notify = xproto::SelectionNotifyEvent {
+            response_type: xproto::SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: 1,
+            requestor: REQUESTOR,
+            selection: 1,
+            target: 7,
+            property: PROPERTY,
+        };
+        let c = pending_conversion(properties.clone(), &client, notify, TYPE, false);
+        client.close();
+        drop(client);
+        drop(peer);
+        // the writer thread holds the last strong reference until it drains and
+        // exits; waiting for it is what makes this deterministic rather than a
+        // race between that thread and the assertion
+        for _ in 0..1000 {
+            if gone.upgrade().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            gone.upgrade().is_none(),
+            "the client outlived its connection"
+        );
+
+        c.finish(Some(b"late".to_vec()));
+        assert!(
+            properties
+                .lock()
+                .unwrap()
+                .get(REQUESTOR, PROPERTY)
+                .is_none(),
+            "answered a connection that no longer exists"
+        );
+    }
 }

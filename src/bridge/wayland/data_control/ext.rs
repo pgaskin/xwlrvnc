@@ -22,17 +22,20 @@ impl DataControlManager for ExtDataControlManagerV1 {
     fn create_device(&self, seat: &wl_seat::WlSeat, qh: &QueueHandle<State>) -> Self::Device {
         self.get_data_device(seat, qh, ())
     }
-    fn create_source(&self, qh: &QueueHandle<State>, sel: Sel) -> Self::Source {
-        self.create_data_source(qh, sel)
+    fn create_source(&self, qh: &QueueHandle<State>, published: Published) -> Self::Source {
+        self.create_data_source(qh, published)
     }
     fn offer(source: &Self::Source, mime: String) {
         source.offer(mime);
     }
-    fn set_selection(device: &Self::Device, sel: Sel, source: &Self::Source) {
+    fn set_selection(device: &Self::Device, sel: Sel, source: Option<&Self::Source>) {
         match sel {
-            Sel::Clipboard => device.set_selection(Some(source)),
-            Sel::Primary => device.set_primary_selection(Some(source)),
+            Sel::Clipboard => device.set_selection(source),
+            Sel::Primary => device.set_primary_selection(source),
         }
+    }
+    fn carries(_device: &Self::Device, _sel: Sel) -> bool {
+        true // ext-data-control-v1 has both from version 1
     }
 }
 
@@ -85,19 +88,23 @@ impl Dispatch<ExtDataControlOfferV1, ()> for State {
     }
 }
 
-impl Dispatch<ExtDataControlSourceV1, Sel> for State {
+impl Dispatch<ExtDataControlSourceV1, Published> for State {
     fn event(
         state: &mut Self,
         source: &ExtDataControlSourceV1,
         event: ext_source_v1::Event,
-        sel: &Sel,
+        published: &Published,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         match event {
             ext_source_v1::Event::Send { mime_type: _, fd } => {
-                let data = state.server.clipboard.x_data(*sel);
-                state.queue_send(fd, data);
+                crate::cliplog!(
+                    "{:?} send: {} bytes to a receiver",
+                    published.sel,
+                    published.data.len()
+                );
+                state.queue_send(fd, published.data.clone());
             }
             ext_source_v1::Event::Cancelled => source.destroy(),
             _ => {}

@@ -22,18 +22,22 @@ impl DataControlManager for ZwlrDataControlManagerV1 {
     fn create_device(&self, seat: &wl_seat::WlSeat, qh: &QueueHandle<State>) -> Self::Device {
         self.get_data_device(seat, qh, ())
     }
-    fn create_source(&self, qh: &QueueHandle<State>, sel: Sel) -> Self::Source {
-        self.create_data_source(qh, sel)
+    fn create_source(&self, qh: &QueueHandle<State>, published: Published) -> Self::Source {
+        self.create_data_source(qh, published)
     }
     fn offer(source: &Self::Source, mime: String) {
         source.offer(mime);
     }
-    fn set_selection(device: &Self::Device, sel: Sel, source: &Self::Source) {
+    fn set_selection(device: &Self::Device, sel: Sel, source: Option<&Self::Source>) {
         match sel {
-            Sel::Clipboard => device.set_selection(Some(source)),
-            Sel::Primary if device.version() >= 2 => device.set_primary_selection(Some(source)),
-            Sel::Primary => {}
+            Sel::Clipboard => device.set_selection(source),
+            Sel::Primary if device.version() >= 2 => device.set_primary_selection(source),
+            Sel::Primary => {} // v1 has no primary selection
         }
+    }
+    fn carries(device: &Self::Device, sel: Sel) -> bool {
+        // set_primary_selection arrived in v2
+        sel == Sel::Clipboard || device.version() >= 2
     }
 }
 
@@ -85,19 +89,23 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for State {
     }
 }
 
-impl Dispatch<ZwlrDataControlSourceV1, Sel> for State {
+impl Dispatch<ZwlrDataControlSourceV1, Published> for State {
     fn event(
         state: &mut Self,
         source: &ZwlrDataControlSourceV1,
         event: zwlr_data_control_source_v1::Event,
-        sel: &Sel,
+        published: &Published,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type: _, fd } => {
-                let data = state.server.clipboard.x_data(*sel);
-                state.queue_send(fd, data);
+                crate::cliplog!(
+                    "{:?} send: {} bytes to a receiver",
+                    published.sel,
+                    published.data.len()
+                );
+                state.queue_send(fd, published.data.clone());
             }
             zwlr_data_control_source_v1::Event::Cancelled => source.destroy(),
             _ => {}

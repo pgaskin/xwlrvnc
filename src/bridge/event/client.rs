@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use crate::bridge::clipboard::Sel;
+use x11rb_protocol::protocol::xfixes;
 
 /// How much may be queued for one client before it is given up on. Events are
 /// pushed from the Wayland thread and replies from the connection thread, and
@@ -52,11 +52,21 @@ impl Outbox {
     }
 }
 
-/// A client's XFixes registration for one selection's owner.
+/// One XFixes selection registration: X keeps one per `(selection, client,
+/// window)` with its own event mask, so a client watching from two windows is
+/// told twice, and clearing one window's mask leaves the other's alone.
 struct SelReg {
-    kind: Sel,
+    /// The selection watched, by its atom. Atoms are server-global, so this is
+    /// the same number for every connection and for the event we send back.
     atom: u32,
     window: u32,
+    mask: xfixes::SelectionEventMask,
+}
+
+/// The mask bit that lets `subtype` through: the bits are numbered like the
+/// subtypes.
+fn mask_for(subtype: xfixes::SelectionEvent) -> xfixes::SelectionEventMask {
+    xfixes::SelectionEventMask::from(1u32 << u8::from(subtype))
 }
 
 /// One connection, as seen by [`EventSink`](super::EventSink): the outbound
@@ -202,7 +212,15 @@ impl Client {
     /// Queues a server-initiated event, stamping the client's current request
     /// sequence under the outbox lock so it can't race a concurrent reply.
     pub fn send_event_bytes(&self, buf: &mut [u8]) {
-        let mut o = self.outbox.lock().unwrap();
+        // Refusing a clipboard conversion sends through here from a `Drop`,
+        // which happens while unwinding a panic, so a poisoned outbox must not
+        // panic again: that would be a panic inside a drop during unwinding,
+        // which aborts the process. The queue is still consistent enough to
+        // take one more buffer, and the writer thread drops it if it is not.
+        let mut o = self
+            .outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let seq = o.monotonic(self.seq.load(Ordering::Relaxed));
         buf[2..4].copy_from_slice(&seq.to_le_bytes());
         o.last_seq = seq;
@@ -245,14 +263,22 @@ impl Client {
         self.root_structure.store(enable, Ordering::Relaxed);
     }
 
-    /// Registers, or with `enable` false clears, XFixes selection-owner
-    /// notifications for one selection kind.
-    pub fn select_selection(&self, kind: Sel, atom: u32, window: u32, enable: bool) {
+    /// Sets the XFixes selection event mask for `window` on the selection
+    /// `atom`; an empty mask drops that registration and no other.
+    pub fn select_selection(&self, atom: u32, window: u32, mask: xfixes::SelectionEventMask) {
         let mut sels = self.selections.lock().unwrap();
-        sels.retain(|s| s.kind != kind);
-        if enable {
-            sels.push(SelReg { kind, atom, window });
+        sels.retain(|s| !(s.atom == atom && s.window == window));
+        if u32::from(mask) != 0 {
+            sels.push(SelReg { atom, window, mask });
         }
+    }
+
+    /// Drops every registration made from `window`, which was destroyed.
+    pub fn forget_window(&self, window: u32) {
+        self.selections
+            .lock()
+            .unwrap()
+            .retain(|s| s.window != window);
     }
 
     /// The window selected for RandR ScreenChangeNotify, 0 if none.
@@ -269,13 +295,15 @@ impl Client {
         self.root_structure.load(Ordering::Relaxed)
     }
 
-    /// The `(window, atom)` of each XFixes registration for `kind`.
-    pub(super) fn selections_for(&self, kind: Sel) -> Vec<(u32, u32)> {
+    /// The `(window, atom)` of each registration for the selection `atom`
+    /// whose mask lets `subtype` through.
+    pub fn selections_for(&self, atom: u32, subtype: xfixes::SelectionEvent) -> Vec<(u32, u32)> {
+        let bit = mask_for(subtype);
         self.selections
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| r.kind == kind)
+            .filter(|r| r.atom == atom && r.mask.contains(bit))
             .map(|r| (r.window, r.atom))
             .collect()
     }
@@ -381,5 +409,88 @@ mod tests {
             }
         }
         assert_eq!(b.read(&mut peek).unwrap(), 0);
+    }
+
+    const CLIP: u32 = 83;
+    const PRI: u32 = 1;
+    const OWNER: xfixes::SelectionEventMask = xfixes::SelectionEventMask::SET_SELECTION_OWNER;
+    const CLOSE: xfixes::SelectionEventMask = xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE;
+
+    fn client() -> Arc<Client> {
+        let (a, _b) = UnixStream::pair().unwrap();
+        Client::new(a).unwrap()
+    }
+
+    #[test]
+    fn mask_bits_are_numbered_like_the_subtypes() {
+        assert_eq!(mask_for(xfixes::SelectionEvent::SET_SELECTION_OWNER), OWNER);
+        assert_eq!(
+            mask_for(xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY),
+            xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+        );
+        assert_eq!(
+            mask_for(xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE),
+            CLOSE
+        );
+    }
+
+    #[test]
+    fn registrations_are_per_window_and_selection() {
+        let c = client();
+        c.select_selection(CLIP, 0x10, OWNER);
+        c.select_selection(CLIP, 0x11, OWNER | CLOSE);
+        c.select_selection(PRI, 0x10, OWNER);
+        let owner = xfixes::SelectionEvent::SET_SELECTION_OWNER;
+        assert_eq!(
+            c.selections_for(CLIP, owner),
+            [(0x10, CLIP), (0x11, CLIP)],
+            "both windows are told"
+        );
+        assert_eq!(c.selections_for(PRI, owner), [(0x10, PRI)]);
+        // clearing one window's mask leaves the other's registration alone
+        c.select_selection(CLIP, 0x10, 0u32.into());
+        assert_eq!(c.selections_for(CLIP, owner), [(0x11, CLIP)]);
+        // re-selecting replaces the mask rather than adding a second record
+        c.select_selection(CLIP, 0x11, OWNER);
+        assert_eq!(c.selections_for(CLIP, owner), [(0x11, CLIP)]);
+    }
+
+    #[test]
+    fn the_mask_picks_the_subtypes() {
+        let c = client();
+        c.select_selection(CLIP, 0x10, CLOSE);
+        assert!(
+            c.selections_for(CLIP, xfixes::SelectionEvent::SET_SELECTION_OWNER)
+                .is_empty()
+        );
+        assert_eq!(
+            c.selections_for(CLIP, xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE),
+            [(0x10, CLIP)]
+        );
+    }
+
+    #[test]
+    fn a_destroyed_window_takes_its_registrations_with_it() {
+        let c = client();
+        c.select_selection(CLIP, 0x10, OWNER);
+        c.select_selection(200, 0x10, OWNER);
+        c.select_selection(CLIP, 0x11, OWNER);
+        c.forget_window(0x10);
+        let owner = xfixes::SelectionEvent::SET_SELECTION_OWNER;
+        assert_eq!(c.selections_for(CLIP, owner), [(0x11, CLIP)]);
+        assert!(c.selections_for(200, owner).is_empty());
+    }
+
+    #[test]
+    fn every_selection_is_found_by_its_atom() {
+        // atoms are the server's, so a registration needs nothing else to
+        // identify the selection it is for, bridged or not
+        let c = client();
+        c.select_selection(200, 0x10, OWNER);
+        c.select_selection(CLIP, 0x10, OWNER);
+        let owner = xfixes::SelectionEvent::SET_SELECTION_OWNER;
+        assert_eq!(c.selections_for(200, owner), [(0x10, 200)]);
+        assert_eq!(c.selections_for(CLIP, owner), [(0x10, CLIP)]);
+        assert!(c.selections_for(999, owner).is_empty());
     }
 }

@@ -27,7 +27,25 @@ macro_rules! fixme {
 }
 /// Verbose log (shown only with `-verbose`).
 macro_rules! vlog { ($($arg:tt)*) => { $crate::logat!(2, $($arg)*) }; }
-pub(crate) use {fixme, log, logat, vlog, warning};
+
+/// Whether `-cliptrace` was given. A global like [`LOG_LEVEL`] rather than a
+/// config lookup because the clipboard bridge spans the X connection threads,
+/// the event sink and the Wayland thread, and the latter two hold no config.
+pub(crate) static CLIP_TRACE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One step of the clipboard/selection state machine (shown only with
+/// `-cliptrace`). Enough of these to follow a copy end to end: who took a
+/// selection, what we asked its owner for, what came back, and what we told
+/// the compositor and the other X clients.
+macro_rules! cliplog {
+    ($($arg:tt)*) => {
+        if $crate::CLIP_TRACE.load(::std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("xwlrvnc: clip: {}", format_args!($($arg)*));
+        }
+    };
+}
+pub(crate) use {cliplog, fixme, log, logat, vlog, warning};
 
 #[macro_use]
 mod util;
@@ -128,6 +146,7 @@ fn main() {
         },
         Ordering::Relaxed,
     );
+    CLIP_TRACE.store(config.cliptrace, Ordering::Relaxed);
     // Take the command out before `config` moves into the Server (which doesn't
     // need it). Without `-nowrap` a command is required.
     let command = std::mem::take(&mut config.command);
@@ -157,6 +176,7 @@ fn main() {
     let input = Arc::new(Input::new(geom.width, geom.height));
     let server = Arc::new(Server {
         config,
+        atoms: Mutex::new(bridge::x11::atom::Atoms::default()),
         screen: Mutex::new(Screen::new(geom.width, geom.height)),
         input,
         events: bridge::event::EventSink::default(),

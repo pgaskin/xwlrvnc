@@ -45,7 +45,7 @@ mod registry;
 mod shm;
 mod transient_seat;
 use capture::Capture;
-use data_control::{DataDevice, PendingSend};
+use data_control::{DataDevice, PendingReceive, PendingSend};
 use input::{KeyboardBackend, PointerBackend};
 use output::OutputAcc;
 use output_config::OutputConfig;
@@ -65,7 +65,6 @@ pub fn spawn(server: Arc<Server>) {
             return;
         }
     };
-    server.clipboard.set_connection(conn.clone());
 
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
@@ -93,8 +92,10 @@ pub fn spawn(server: Arc<Server>) {
         ext_manager: None,
         wlr_manager: None,
         device: None,
+        publish: None,
         offer_mimes: HashMap::new(),
         pending_sends: Vec::new(),
+        pending_receives: Vec::new(),
         shm: None,
         screencopy: None,
         ext_source_mgr: None,
@@ -136,9 +137,29 @@ pub fn spawn(server: Arc<Server>) {
     // the seats and their names have all landed by now; say so if none was
     // usable rather than leave input silently dead
     state.warn_if_no_seat();
-    let wake_fd = state.server.dynres.wake_fd();
-
+    let dynres_wake = state.server.dynres.wake_fd();
+    let clip_wake = state.server.clipboard.jobs().wake_fd();
     std::thread::spawn(move || {
+        // Marks the window in which the X threads have somewhere to post their
+        // clipboard work. Outside it they are told there is nobody to do it and
+        // refuse, rather than leaving requestors waiting for an answer that
+        // would never come — and because it is a guard, that holds however this
+        // thread ends, including unwinding from a panic in a Dispatch impl or a
+        // capture tick.
+        struct Draining(Arc<Server>);
+        impl Draining {
+            fn new(server: Arc<Server>) -> Self {
+                server.clipboard.jobs().set_running(true);
+                Self(server)
+            }
+        }
+        impl Drop for Draining {
+            fn drop(&mut self) {
+                self.0.clipboard.jobs().set_running(false);
+            }
+        }
+        let _draining = Draining::new(state.server.clone());
+
         // A manual loop rather than blocking_dispatch, so capture can self-pace:
         // each pass issues whatever is due, then waits on the socket only until
         // the next capture is scheduled.
@@ -147,9 +168,13 @@ pub fn spawn(server: Arc<Server>) {
             if let Err(e) = queue.dispatch_pending(&mut state) {
                 crate::warning!("wayland dispatch failed, continuing: {e}");
             }
-            // before the tick, so a stalled clipboard send makes progress on
-            // every pass however we got here
+            // after the dispatch, so an offer a selection change replaced is
+            // destroyed in the same pass that replaced it
+            state.run_clip_jobs(&conn);
+            // before the tick, so a stalled clipboard transfer makes progress
+            // on every pass however we got here
             state.flush_pending_sends();
+            state.flush_pending_receives();
             state.tick_dynres(&qh);
             let timeout = state.tick_captures(&qh);
             if let Err(e) = conn.flush() {
@@ -163,29 +188,46 @@ pub fn spawn(server: Arc<Server>) {
                 continue; // events already queued, go dispatch them
             };
             pfds.clear();
+            // the fixed three come first, so their revents are at known
+            // indices; everything after them is a clipboard transfer's pipe
             pfds.push(libc::pollfd {
                 fd: guard.connection_fd().as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             });
-            // wake as soon as a stalled send's receiver drains its pipe, rather
-            // than waiting out the capture interval
+            // wake as soon as an X client parks a resolution change (-dynres),
+            // rather than after the capture interval
+            pfds.push(libc::pollfd {
+                fd: dynres_wake,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            // likewise for clipboard work an X thread posted: a paste waits on
+            // it, so it must not sit in the queue for a capture interval
+            pfds.push(libc::pollfd {
+                fd: clip_wake,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            // wake as soon as a stalled send's receiver drains its pipe, or a
+            // value we are reading for an X requestor arrives
             pfds.extend(state.pending_send_fds().map(|fd| libc::pollfd {
                 fd,
                 events: libc::POLLOUT,
                 revents: 0,
             }));
-            // wake as soon as an X client parks a resolution change (-dynres),
-            // rather than after the capture interval
-            pfds.push(libc::pollfd {
-                fd: wake_fd,
+            pfds.extend(state.pending_receive_fds().map(|fd| libc::pollfd {
+                fd,
                 events: libc::POLLIN,
                 revents: 0,
-            });
+            }));
             let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
             let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
-            if n > 0 && pfds.last().is_some_and(|p| p.revents & libc::POLLIN != 0) {
+            if n > 0 && pfds[1].revents & libc::POLLIN != 0 {
                 state.server.dynres.drain_wake();
+            }
+            if n > 0 && pfds[2].revents & libc::POLLIN != 0 {
+                state.server.clipboard.jobs().drain_wake();
             }
             if n > 0 && pfds[0].revents & libc::POLLIN != 0 {
                 match guard.read() {
@@ -245,10 +287,16 @@ struct State {
     ext_manager: Option<ExtDataControlManagerV1>, // clipboard, preferred
     wlr_manager: Option<ZwlrDataControlManagerV1>, // clipboard, fallback
     device: Option<DataDevice>,
+    /// Publishes an X-owned selection on that device, or withdraws ours. Only
+    /// ever called from this thread, out of a `Publish` job.
+    publish: Option<clipboard::Publisher>,
     offer_mimes: HashMap<ObjectId, Vec<String>>, // keyed by the offer's object id
     /// X-owned selections still being written to a receiving app's pipe. See
     /// [`State::queue_send`].
     pending_sends: Vec<PendingSend>,
+    /// Wayland-owned selections still being read for a waiting X requestor.
+    /// See [`State::start_receive`].
+    pending_receives: Vec<PendingReceive>,
     shm: Option<wl_shm::WlShm>,
     screencopy: Option<ZwlrScreencopyManagerV1>, // capture, fallback
     ext_source_mgr: Option<ExtOutputImageCaptureSourceManagerV1>, // capture, preferred
@@ -351,6 +399,10 @@ impl State {
     fn wayland_lost(&mut self) {
         self.dynres_fail("the wayland connection was lost");
         self.server.dynres.set_available(false);
+        // nothing will carry a clipboard job over any more: what is queued is
+        // refused now, and what is posted later is refused on the spot, rather
+        // than leaving X requestors waiting for an answer forever
+        self.server.clipboard.jobs().set_running(false);
     }
 
     /// Commits to a seat for input, wiring up virtual input and creating its

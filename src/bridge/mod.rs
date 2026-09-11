@@ -7,6 +7,7 @@
 
 pub mod capture;
 pub mod clipboard;
+pub mod clipjobs;
 pub mod cursor;
 pub mod damage;
 pub mod dynres;

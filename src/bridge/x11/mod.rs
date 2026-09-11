@@ -1,12 +1,13 @@
 //! A minimal X11 server implementing enough for RealVNC to work and for Xlib
 //! not to fail.
-mod atom;
+pub(crate) mod atom;
 pub mod conn;
 pub mod ext;
 mod mit_shm;
 mod property;
 pub mod randr;
 mod selection;
+mod targets;
 mod window;
 mod xfixes;
 

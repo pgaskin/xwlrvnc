@@ -39,6 +39,8 @@ define_config! {
         profile: bool = flag,
         /// trace requests to stderr
         xtrace: bool = flag,
+        /// trace clipboard and selection handling to stderr
+        cliptrace: bool = flag,
         /// suppress informational logging
         quiet: bool = flag,
         /// log extra detail

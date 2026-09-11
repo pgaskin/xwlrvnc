@@ -1,13 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use crate::bridge::capture::Framebuffer;
-use crate::bridge::clipboard::Clipboard;
+use crate::bridge::clipboard::{Clipboard, Sel};
 use crate::bridge::cursor::CursorState;
 use crate::bridge::damage::DamageSink;
 use crate::bridge::dynres::DynRes;
 use crate::bridge::event::EventSink;
 use crate::bridge::input::Input;
 use crate::bridge::keymap::KeyTable;
+use crate::bridge::x11::atom::{Atoms, XA_PRIMARY};
 use crate::bridge::x11::randr::Screen;
 use crate::config::Config;
 use crate::util::Geometry;
@@ -15,6 +16,8 @@ use crate::util::Geometry;
 /// Shared, connection-independent server state.
 pub(crate) struct Server {
     pub config: Config,
+    /// Interned atoms, shared by every connection as X shares them.
+    pub atoms: Mutex<Atoms>,
     pub screen: Mutex<Screen>,
     pub input: Arc<Input>,
     pub events: EventSink,
@@ -31,6 +34,16 @@ pub(crate) struct Server {
 }
 
 impl Server {
+    /// The atom naming a bridged selection. Every connection sees the same
+    /// number for it, so it is also the one to put in an event.
+    pub fn selection_atom(&self, sel: Sel) -> u32 {
+        match sel {
+            Sel::Primary => XA_PRIMARY,
+            // interning is idempotent: whoever asks first fixes the number
+            Sel::Clipboard => self.atoms.lock().unwrap().intern(b"CLIPBOARD", false),
+        }
+    }
+
     pub fn geometry(&self) -> Geometry {
         let s = self.screen.lock().unwrap();
         Geometry {
