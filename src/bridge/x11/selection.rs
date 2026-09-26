@@ -1,12 +1,24 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use crate::bridge::clipboard::{Sel, stale_owner_time};
+use crate::bridge::clipboard::{MAX_SELECTION_BYTES, Sel, stale_owner_time};
 use crate::bridge::event::server_time_ms;
 use crate::bridge::x11::SELECTION_FETCH_WINDOW;
 
+/// How long an X owner has to answer a `ConvertSelection` of ours, and how
+/// long a chunked transfer may go without a chunk, before the fetch is given
+/// up on as though the owner had refused. Xt gives an owner 5 s; this is
+/// looser, since giving up on one that would still have answered costs its
+/// value, while waiting on one that never will costs only a clipboard that
+/// stays stale this long. Nothing waits on it: the connection thread sleeps
+/// no longer than this while a fetch is out (see `Connection::run`).
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How many unanswered `ConvertSelection`s to remember. Two selections times a
-/// couple of rapid re-takes is the realistic worst case.
-const MAX_FETCHES: usize = 8;
+/// couple of rapid re-takes is the realistic worst case; anything near this
+/// is a client taking a selection over and over without ever answering for
+/// it, and the oldest is the one least likely to still be coming.
+const MAX_FETCHES: usize = 32;
 
 /// Per-connection clipboard/selection state machine.
 #[derive(Default)]
@@ -23,9 +35,13 @@ pub struct Selection {
     /// takes PRIMARY and CLIPBOARD in the same breath, and a selection can be
     /// taken again before the first answer arrives, so several are in flight at
     /// once. Each is matched by the property it was told to use, which is why
-    /// every fetch gets its own; keying by selection alone would let the first
-    /// answer be consumed as though it were the second's, publishing the older
-    /// copy and dropping the newer.
+    /// each fetch gets a property of its own from a ring of them; keying by
+    /// selection alone would let the first answer be consumed as though it
+    /// were the second's, publishing the older copy and dropping the newer.
+    /// The ring is wide enough that a property is not reused inside
+    /// [`FETCH_TIMEOUT`], by which time the fetch that had it is resolved, one
+    /// way or the other: every fetch begun here is answered, refused, timed
+    /// out or displaced, and never merely forgotten.
     fetches: Vec<Fetch>,
     /// Chunked receives in progress, keyed by the property they arrive on.
     /// Each fetch uses its own property, so two can run at once.
@@ -49,17 +65,26 @@ pub struct Fetch {
     /// good if that acquisition is still the current one.
     pub owner: u32,
     pub time: u32,
+    /// When it was asked, from which the owner has [`FETCH_TIMEOUT`] to answer.
+    pub since: Instant,
 }
 
 /// An in-flight chunked receive.
 struct IncrRecv {
     fetch: Fetch,
     data: Vec<u8>,
+    /// When the last chunk came (or the transfer began): a chunked transfer
+    /// has [`FETCH_TIMEOUT`] between chunks rather than in all, since a large
+    /// value from a slow owner is still coming as long as chunks are.
+    progress_at: Instant,
 }
 
 pub enum IncrStep {
     More(u32),
     Done(Fetch, Vec<u8>),
+    /// The value went past [`MAX_SELECTION_BYTES`]: the transfer is abandoned
+    /// where it is, and the fetch is resolved as unanswered.
+    TooBig(Fetch),
 }
 
 impl Selection {
@@ -101,18 +126,53 @@ impl Selection {
         gone
     }
 
-    /// Records a `ConvertSelection` we just issued to an X owner, dropping any
-    /// half-finished chunked receive left on the same property.
-    pub fn begin_fetch(&mut self, fetch: Fetch) {
+    /// Records a `ConvertSelection` we just issued to an X owner, handing
+    /// back the fetches it displaces: one still out on the same property (the
+    /// ring has come back around to it), a chunked receive on that property,
+    /// and the oldest past [`MAX_FETCHES`]. Each of those is a request that
+    /// was never answered, and the caller resolves it as such. A fetch
+    /// forgotten silently is an acquisition XFixes watchers never hear of and
+    /// a previous owner's value served for it indefinitely, on both sides.
+    #[must_use = "the fetches displaced have to be resolved"]
+    pub fn begin_fetch(&mut self, fetch: Fetch) -> Vec<Fetch> {
         let property = fetch.property;
-        self.incr.remove(&property);
-        self.fetches.retain(|f| f.property != property);
-        // an owner that never answers must not pile up state; the oldest is the
-        // one least likely to still be coming
-        if self.fetches.len() >= MAX_FETCHES {
-            self.fetches.remove(0);
+        let mut displaced: Vec<Fetch> = self
+            .incr
+            .remove(&property)
+            .map(|i| i.fetch)
+            .into_iter()
+            .collect();
+        displaced.extend(self.fetches.extract_if(.., |f| f.property == property));
+        while self.fetches.len() >= MAX_FETCHES {
+            displaced.push(self.fetches.remove(0));
         }
         self.fetches.push(fetch);
+        displaced
+    }
+
+    /// Takes out every fetch whose owner has had [`FETCH_TIMEOUT`] to answer
+    /// and has not, and every chunked receive that has gone that long without
+    /// a chunk, for the caller to resolve as unanswered.
+    pub fn expired(&mut self, now: Instant) -> Vec<Fetch> {
+        let timed_out = |since: Instant| now.duration_since(since) >= FETCH_TIMEOUT;
+        let mut out: Vec<Fetch> = self
+            .fetches
+            .extract_if(.., |f| timed_out(f.since))
+            .collect();
+        out.extend(
+            self.incr
+                .extract_if(|_, i| timed_out(i.progress_at))
+                .map(|(_, i)| i.fetch),
+        );
+        out
+    }
+
+    /// When the fetch or chunked receive with the least time left runs out of
+    /// it, if any is out at all.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let fetches = self.fetches.iter().map(|f| f.since);
+        let incrs = self.incr.values().map(|i| i.progress_at);
+        fetches.chain(incrs).min().map(|t| t + FETCH_TIMEOUT)
     }
 
     /// Takes the fetch this `SelectionNotify` answers.
@@ -136,6 +196,7 @@ impl Selection {
             IncrRecv {
                 fetch,
                 data: Vec::new(),
+                progress_at: Instant::now(),
             },
         );
     }
@@ -146,8 +207,10 @@ impl Selection {
     }
 
     /// Handles one INCR chunk. An empty chunk completes the transfer (returning
-    /// the assembled value), and a non-empty chunk is accumulated. Check
-    /// [`incr_chunk`](Self::incr_chunk) first.
+    /// the assembled value), and a non-empty chunk is accumulated — up to
+    /// [`MAX_SELECTION_BYTES`], the same cap the other direction has, past
+    /// which the transfer is abandoned rather than the owner allowed to grow us
+    /// without limit. Check [`incr_chunk`](Self::incr_chunk) first.
     pub fn incr_push(&mut self, property: u32, chunk: Vec<u8>) -> IncrStep {
         if chunk.is_empty() {
             let incr = self
@@ -160,7 +223,12 @@ impl Selection {
                 .incr
                 .get_mut(&property)
                 .expect("incr_push without an active INCR receive");
+            if incr.data.len().saturating_add(chunk.len()) > MAX_SELECTION_BYTES {
+                let incr = self.incr.remove(&property).expect("checked just above");
+                return IncrStep::TooBig(incr.fetch);
+            }
             incr.data.extend_from_slice(&chunk);
+            incr.progress_at = Instant::now();
             IncrStep::More(property)
         }
     }
@@ -183,7 +251,18 @@ mod tests {
             property,
             owner: 0x10,
             time: 1,
+            since: Instant::now(),
         }
+    }
+
+    /// Begins a fetch that displaces nothing.
+    fn begin(s: &mut Selection, f: Fetch) {
+        assert!(s.begin_fetch(f).is_empty(), "nothing was displaced");
+    }
+
+    /// A moment after every fetch begun so far has run out of time.
+    fn later() -> Instant {
+        Instant::now() + FETCH_TIMEOUT + Duration::from_secs(1)
     }
 
     fn answered(s: &mut Selection, selection: u32, property: u32) -> Option<(Sel, u32)> {
@@ -196,8 +275,8 @@ mod tests {
         // the same selection taken twice before either answer arrives: the
         // first answer must be the first copy, not be consumed as the second's
         let mut s = Selection::default();
-        s.begin_fetch(fetch(Sel::Clipboard, CLIP, P1));
-        s.begin_fetch(fetch(Sel::Clipboard, CLIP, P2));
+        begin(&mut s, fetch(Sel::Clipboard, CLIP, P1));
+        begin(&mut s, fetch(Sel::Clipboard, CLIP, P2));
         assert_eq!(answered(&mut s, CLIP, P1), Some((Sel::Clipboard, P1)));
         assert_eq!(answered(&mut s, CLIP, P2), Some((Sel::Clipboard, P2)));
     }
@@ -205,8 +284,8 @@ mod tests {
     #[test]
     fn two_selections_in_flight_do_not_collide() {
         let mut s = Selection::default();
-        s.begin_fetch(fetch(Sel::Primary, PRI, P1));
-        s.begin_fetch(fetch(Sel::Clipboard, CLIP, P2));
+        begin(&mut s, fetch(Sel::Primary, PRI, P1));
+        begin(&mut s, fetch(Sel::Clipboard, CLIP, P2));
         assert_eq!(answered(&mut s, CLIP, P2), Some((Sel::Clipboard, P2)));
         assert_eq!(answered(&mut s, PRI, P1), Some((Sel::Primary, P1)));
     }
@@ -215,8 +294,8 @@ mod tests {
     fn a_refusal_matches_the_oldest_request_for_that_selection() {
         // a refusal names no property, and answers come back in order
         let mut s = Selection::default();
-        s.begin_fetch(fetch(Sel::Clipboard, CLIP, P1));
-        s.begin_fetch(fetch(Sel::Clipboard, CLIP, P2));
+        begin(&mut s, fetch(Sel::Clipboard, CLIP, P1));
+        begin(&mut s, fetch(Sel::Clipboard, CLIP, P2));
         assert_eq!(answered(&mut s, CLIP, 0), Some((Sel::Clipboard, P1)));
         assert_eq!(answered(&mut s, CLIP, P2), Some((Sel::Clipboard, P2)));
     }
@@ -224,25 +303,104 @@ mod tests {
     #[test]
     fn an_answer_to_nothing_is_ignored() {
         let mut s = Selection::default();
-        s.begin_fetch(fetch(Sel::Clipboard, CLIP, P1));
+        begin(&mut s, fetch(Sel::Clipboard, CLIP, P1));
         assert_eq!(answered(&mut s, CLIP, 999), None, "not our property");
         assert_eq!(answered(&mut s, PRI, P1), None, "not our selection");
         assert_eq!(answered(&mut s, CLIP, P1), Some((Sel::Clipboard, P1)));
     }
 
     #[test]
-    fn owners_that_never_answer_do_not_pile_up() {
+    fn a_fetch_whose_property_comes_round_again_is_handed_back() {
+        // the property ring has wrapped to a fetch still out: it is not
+        // forgotten, it is given back to be resolved, and the answer that
+        // names the property from now on is the new fetch's
         let mut s = Selection::default();
-        for i in 0..(MAX_FETCHES as u32 * 2) {
-            s.begin_fetch(fetch(Sel::Clipboard, CLIP, 200 + i));
+        begin(&mut s, fetch(Sel::Clipboard, CLIP, P1));
+        let displaced = s.begin_fetch(fetch(Sel::Primary, PRI, P1));
+        assert_eq!(
+            displaced.iter().map(|f| f.kind).collect::<Vec<_>>(),
+            [Sel::Clipboard]
+        );
+        assert_eq!(answered(&mut s, CLIP, P1), None, "gone");
+        assert_eq!(answered(&mut s, PRI, P1), Some((Sel::Primary, P1)));
+        // a chunked receive on it likewise
+        s.begin_incr(fetch(Sel::Clipboard, CLIP, P2));
+        let displaced = s.begin_fetch(fetch(Sel::Primary, PRI, P2));
+        assert_eq!(displaced.len(), 1);
+        assert!(!s.incr_chunk(SELECTION_FETCH_WINDOW, P2));
+    }
+
+    #[test]
+    fn owners_that_never_answer_do_not_pile_up() {
+        // past the limit the oldest is displaced — handed back, not dropped
+        let mut s = Selection::default();
+        for i in 0..MAX_FETCHES as u32 {
+            begin(&mut s, fetch(Sel::Clipboard, CLIP, 200 + i));
         }
+        let displaced = s.begin_fetch(fetch(Sel::Clipboard, CLIP, 200 + MAX_FETCHES as u32));
+        assert_eq!(
+            displaced.iter().map(|f| f.property).collect::<Vec<_>>(),
+            [200],
+            "the oldest"
+        );
         assert_eq!(s.fetches.len(), MAX_FETCHES);
+        assert_eq!(answered(&mut s, CLIP, 200), None);
         // the newest is still answerable
-        let newest = 200 + (MAX_FETCHES as u32 * 2 - 1);
+        let newest = 200 + MAX_FETCHES as u32;
         assert_eq!(
             answered(&mut s, CLIP, newest),
             Some((Sel::Clipboard, newest))
         );
+    }
+
+    #[test]
+    fn an_owner_that_never_answers_runs_out_of_time() {
+        // with no deadline, a silent owner's acquisition would never be
+        // announced and the previous owner's value never withdrawn
+        let mut s = Selection::default();
+        assert_eq!(s.next_deadline(), None, "nothing to wait for");
+        let f = fetch(Sel::Clipboard, CLIP, P1);
+        begin(&mut s, f);
+        assert_eq!(s.next_deadline(), Some(f.since + FETCH_TIMEOUT));
+        assert!(s.expired(Instant::now()).is_empty(), "not yet");
+        assert_eq!(s.expired(later()), [f]);
+        assert_eq!(answered(&mut s, CLIP, P1), None, "resolved, so gone");
+        assert_eq!(s.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_chunked_receive_that_stalls_runs_out_of_time() {
+        let mut s = Selection::default();
+        let f = fetch(Sel::Clipboard, CLIP, P1);
+        begin(&mut s, f);
+        assert_eq!(answered(&mut s, CLIP, P1), Some((Sel::Clipboard, P1)));
+        s.begin_incr(f);
+        assert!(
+            s.next_deadline().is_some(),
+            "the transfer has a deadline too"
+        );
+        assert!(matches!(
+            s.incr_push(P1, b"chunk".to_vec()),
+            IncrStep::More(P1)
+        ));
+        assert!(s.expired(Instant::now()).is_empty());
+        assert_eq!(s.expired(later()).len(), 1, "the owner stopped sending");
+        assert!(!s.incr_chunk(SELECTION_FETCH_WINDOW, P1), "abandoned");
+    }
+
+    #[test]
+    fn a_chunked_receive_is_capped() {
+        let mut s = Selection::default();
+        s.begin_incr(fetch(Sel::Clipboard, CLIP, P1));
+        assert!(matches!(
+            s.incr_push(P1, vec![0; MAX_SELECTION_BYTES]),
+            IncrStep::More(P1)
+        ));
+        match s.incr_push(P1, b"x".to_vec()) {
+            IncrStep::TooBig(f) => assert_eq!(f.property, P1),
+            _ => panic!("one byte over the cap was accepted"),
+        }
+        assert!(!s.incr_chunk(SELECTION_FETCH_WINDOW, P1), "abandoned");
     }
 
     #[test]

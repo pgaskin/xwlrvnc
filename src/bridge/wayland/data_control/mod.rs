@@ -21,7 +21,7 @@ use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1
 use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_device_v1::ZwlrDataControlDeviceV1;
 
 use super::*;
-use crate::bridge::clipboard::Published;
+use crate::bridge::clipboard::{MAX_SELECTION_BYTES, Published};
 use crate::bridge::clipjobs::{Job, PendingConversion};
 
 mod ext;
@@ -58,12 +58,6 @@ const RECEIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// steadily it progresses. The idle budget alone lets an app that trickles a
 /// byte every few seconds hold a pipe (and the requestor) indefinitely.
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The largest selection we will carry in either direction. It is buffered
-/// whole, then copied into a property and a `GetProperty` reply, so this is
-/// really three times as much; it matches the per-client outbox cap, past
-/// which the reply could not be delivered anyway.
-const MAX_SELECTION_BYTES: usize = 64 << 20;
 
 /// The live device, whichever protocol won. Held so it can be destroyed if ext
 /// replaces wlr: dropping the proxy does not send `destroy`, so the compositor

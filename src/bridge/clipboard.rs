@@ -77,6 +77,12 @@ impl DataOffer {
 /// The synthetic window we report as the owner of Wayland-backed selections.
 pub const OWNER_WINDOW: u32 = 0x0000_016c;
 
+/// The largest selection we will carry in either direction. It is buffered
+/// whole, then copied into a property and a `GetProperty` reply, so this is
+/// really three times as much; it matches the per-client outbox cap, past
+/// which the reply could not be delivered anyway.
+pub const MAX_SELECTION_BYTES: usize = 64 << 20;
+
 /// Mime types we advertise to Wayland for X-owned text selections. Only ever
 /// text: `UTF8_STRING` is the one target we ask X owners for.
 pub const TEXT_MIMES: &[&str] = &[
@@ -285,9 +291,12 @@ impl Effects {
     pub fn apply(self, server: &crate::bridge::Server, sel: Sel) {
         if !self.destroy.is_empty() {
             // read outside the queue lock, unlike `Jobs::post`'s own check.
-            // Safe only because `running` is a one-way latch: set true once at
-            // startup and never set back while a thread exists to race us. A
-            // reconnect path that flipped it would make this a real race.
+            // `running` is no latch — it goes back to false when the Wayland
+            // thread loses the compositor or exits — but either side of that
+            // race is safe here: a stale `true` is caught by `post`, which
+            // rechecks under the lock and drops the job, and a `false` means
+            // the thread is gone or on its way out and dispatching nothing
+            // for these offers, so nobody is touching them but us.
             if server.clipboard.jobs.running() {
                 server.clipboard.jobs.post(Job::Destroy(self.destroy));
             } else {
@@ -606,7 +615,8 @@ impl Clipboard {
     ) -> Effects {
         let mut fx = Effects::default();
         let mut g = self.inner.lock().unwrap();
-        if g.sel_mut(sel).take_echo(sel, offer.is_some(), &mimes) {
+        let echo = g.sel_mut(sel).take_echo(sel, offer.is_some(), &mimes);
+        if echo {
             // Nothing changed for X: the X owner we published this for was
             // announced to watchers when it took the selection, and a second
             // notification would name a foreign owner that does not exist.
@@ -620,28 +630,34 @@ impl Clipboard {
                 fx.destroy.extend(offer);
                 return fx;
             }
-            // published for an owner a foreign app displaced before the
-            // compositor got to our source: whoever won the race, this is
-            // still the truth about what the compositor shows now
-            let prev = g.sel_mut(sel).enter(
-                sel,
-                "our own source, with no X owner left to hold it",
-                Owner::wayland(offer, mimes),
-            );
-            fx.destroy.extend(prev.into_offer());
-            return fx;
+            // nor for a withdrawal echoed once its owner has already gone: the
+            // selection was announced as nobody's when it went, and still is
+            if offer.is_none() && matches!(g.sel(sel).owner, Owner::None) {
+                crate::cliplog!("{sel:?}: the compositor echoed our withdrawal; nobody owns it");
+                return fx;
+            }
+            // Published for an owner a foreign app displaced (or that went
+            // away) before the compositor got to our source: whoever won the
+            // race, this is the truth about what the compositor shows now —
+            // and not what X clients were last told, which was the foreign
+            // app's value. So it is a change like any other, and announced
+            // as one; a notification too many costs a re-read, one too few
+            // leaves them serving the wrong text.
         }
         let at = g.next_timestamp();
         let window = if offer.is_some() { OWNER_WINDOW } else { 0 };
         let state = g.sel_mut(sel);
         state.last_changed = at;
         // whatever we had published is not what the compositor shows now, so
-        // it is not ours to withdraw either
-        state.published = false;
-        let why = if offer.is_some() {
-            "a wayland app took it"
-        } else {
-            "the compositor cleared it"
+        // it is not ours to withdraw either (an echo settled that already)
+        if !echo {
+            state.published = false;
+        }
+        let why = match (echo, offer.is_some()) {
+            (true, true) => "our own source, with no X owner left to hold it",
+            (true, false) => "our own withdrawal, of what a wayland app had replaced",
+            (false, true) => "a wayland app took it",
+            (false, false) => "the compositor cleared it",
         };
         let prev = state.enter(sel, why, Owner::wayland(offer, mimes));
         fx.at = at;
@@ -710,7 +726,16 @@ impl Clipboard {
             }
             // X lets any client clear any selection (`dix/selection.c` checks
             // nothing but the time), but a Wayland app's clipboard is not ours
-            // to wipe, so only an X owner is actually released here
+            // to wipe: that request is taken and changes nothing, so watchers
+            // are told nothing and the selection's time stays. An `owner = 0`
+            // they could see was false (`GetSelectionOwner` says otherwise)
+            // would cost a viewer that believes it the Wayland clipboard until
+            // the next copy, and it is what `xsel -c` and some clipboard
+            // managers send.
+            if matches!(g.sel(sel).owner, Owner::Wayland { .. }) {
+                crate::cliplog!("{sel:?}: an x client released a wayland app's selection; ignored");
+                return Take::Took(Effects::default());
+            }
             if matches!(g.sel(sel).owner, Owner::X(_))
                 && let Owner::X(o) = g.sel_mut(sel).enter(sel, "released", Owner::None)
             {
@@ -1157,10 +1182,39 @@ mod tests {
         );
         // ours is still owed, and still recognised when it comes; with no X
         // owner left to attribute it to, it is simply what the compositor
-        // shows now
+        // shows now — which is not what X clients were last told, so they
+        // hear of it as a change
+        let before = c.last_changed(Sel::Clipboard);
         let fx = announce(&c, Sel::Clipboard, &text_mimes());
-        assert!(fx.notified().is_none(), "our own source, announced late");
+        assert!(
+            fx.notified().is_some_and(|(w, _)| w == OWNER_WINDOW),
+            "our own source, announced late, is still a change of content"
+        );
+        assert!(fx.cleared.is_none(), "no X client lost anything");
+        assert!(time_cmp(c.last_changed(Sel::Clipboard), before).is_gt());
         assert_eq!(c.owner_window(Sel::Clipboard), Some(OWNER_WINDOW));
+        assert_eq!(c.mimes(Sel::Clipboard), text_mimes());
+    }
+
+    #[test]
+    fn the_echo_of_a_withdrawal_for_an_owner_already_gone_changes_nothing() {
+        let c = clipboard(true);
+        let client = new_client();
+        let t = take(&c, Sel::Clipboard, &client);
+        c.x_fetched(Sel::Clipboard, 0x10, t, b"ours".to_vec());
+        announced(&c, Sel::Clipboard, &text_mimes());
+        let close = xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE;
+        let fx = c
+            .x_owner_gone(Sel::Clipboard, &client, None, close)
+            .expect("its owner");
+        assert_eq!(fx.notified(), Some((0, t)));
+        assert_eq!(c.jobs().publishes().last(), Some(&(Sel::Clipboard, None)));
+        // watchers heard owner = 0 when it went; the withdrawal coming back
+        // as an announcement of nothing is the same news, and the time stays
+        let fx = c.wayland_announced(Sel::Clipboard, None, Vec::new());
+        assert!(fx.notified().is_none());
+        assert_eq!(c.owner_window(Sel::Clipboard), None);
+        assert_eq!(c.last_changed(Sel::Clipboard), t);
     }
 
     #[test]
@@ -1311,11 +1365,17 @@ mod tests {
         let c = clipboard(true);
         let mimes = vec!["text/plain".to_string()];
         announced(&c, Sel::Clipboard, &mimes);
+        let t = c.last_changed(Sel::Clipboard);
         let fx = took(c.x_released(Sel::Clipboard, server_time_ms()));
         assert!(fx.cleared.is_none());
         assert_eq!(c.owner_window(Sel::Clipboard), Some(OWNER_WINDOW));
         assert_eq!(c.mimes(Sel::Clipboard), mimes);
         assert!(c.jobs().publishes().is_empty(), "nothing withdrawn");
+        // and since nothing changed, nobody is told anything: an owner = 0
+        // that GetSelectionOwner contradicts would lose a viewer that
+        // believes it the app's clipboard until the next copy
+        assert!(fx.notified().is_none(), "no change to announce");
+        assert_eq!(c.last_changed(Sel::Clipboard), t, "TIMESTAMP stays put");
     }
 
     #[test]

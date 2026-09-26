@@ -1,4 +1,5 @@
 use std::io::{self, BufReader, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -20,7 +21,7 @@ use super::window::Windows;
 use super::xfixes::Regions;
 use super::{ROOT_COLORMAP, ROOT_DEPTH, ROOT_VISUAL, ROOT_WINDOW};
 use crate::bridge::Server;
-use crate::bridge::clipboard::{Sel, Take, Value};
+use crate::bridge::clipboard::{MAX_SELECTION_BYTES, Sel, Take, Value};
 use crate::bridge::clipjobs::{Job, PendingConversion};
 use crate::bridge::event::Client;
 use crate::bridge::x11::atom::{XA_INTEGER, XA_PRIMARY};
@@ -28,8 +29,13 @@ use crate::bridge::x11::ext::EXTENSIONS;
 use crate::bridge::x11::randr as randr_screen;
 use crate::bridge::x11::{CLIENT_RESOURCE_ID_BASE, SELECTION_FETCH_WINDOW};
 
-/// How many property names the fetch ring cycles through.
-const FETCH_PROPERTIES: u32 = 4;
+/// How many property names the fetch ring cycles through, per selection. A
+/// property that comes round again while the fetch that had it is still out
+/// displaces that fetch, and its late answer would then be taken for the new
+/// one's (see [`Selection::begin_fetch`]); so this has to be more fetches
+/// than a client can plausibly start inside `FETCH_TIMEOUT`, after which the
+/// old one is gone anyway. Atoms are never freed, so it is not unbounded.
+const FETCH_PROPERTIES: u32 = 32;
 use crate::util::{Geometry, bbox, mm};
 
 /// The largest request we accept, in 4-byte units including the header, as
@@ -71,9 +77,9 @@ pub struct Connection {
     properties: Arc<Mutex<Properties>>,
     /// Clipboard/selection state machine (owners, in-flight fetches, INCR).
     selection: Selection,
-    /// Cycles the property name each fetch uses, so an answer can be told from
-    /// a stale one. A small ring rather than a fresh atom per fetch: atoms are
-    /// interned for the life of the connection and never freed.
+    /// Cycles the property name each fetch uses, so an answer can be told
+    /// from a stale one: a ring of [`FETCH_PROPERTIES`] rather than a fresh
+    /// atom per fetch, since atoms are interned for good and never freed.
     fetch_seq: u32,
     /// MIT-SHM segments the client attached, for ShmGetImage.
     shm: Shm,
@@ -109,7 +115,24 @@ impl Connection {
         // only now: an event fanned out from another thread before the setup
         // bytes were queued would land ahead of them on the wire
         self.server.events.register(&self.client);
-        while let Some(raw) = read_request(&mut self.reader)? {
+        loop {
+            // An X owner we have asked for its selection may never answer, and
+            // an owner that is silent on that is usually silent altogether: so
+            // while a fetch is out this thread waits for the next request no
+            // longer than the fetch has left, and gives up on it in time
+            // rather than leaving watchers untold and the previous owner's
+            // value served on both sides for as long as the client says
+            // nothing. Nothing else can: the fetch is this connection's.
+            self.sweep_fetches();
+            if let Some(deadline) = self.selection.next_deadline()
+                && self.reader.buffer().is_empty()
+                && !wait_readable(self.reader.get_ref(), deadline)?
+            {
+                continue;
+            }
+            let Some(raw) = read_request(&mut self.reader)? else {
+                break;
+            };
             self.seq = self.seq.wrapping_add(1);
             self.client.set_seq(self.seq);
             self.dispatch(raw)?;
@@ -248,6 +271,15 @@ impl Connection {
                             property,
                             xproto::Property::DELETE,
                         ),
+                        // and no ack, so the owner sends no more of it
+                        IncrStep::TooBig(fetch) => {
+                            crate::cliplog!(
+                                "{:?} owner {:#x} sent more than {MAX_SELECTION_BYTES} bytes; giving up on it",
+                                fetch.kind,
+                                fetch.owner
+                            );
+                            self.fetched(fetch, None);
+                        }
                     }
                     return Ok(());
                 }
@@ -1523,14 +1555,29 @@ impl Connection {
         self.fetch_seq = self.fetch_seq.wrapping_add(1) % FETCH_PROPERTIES;
         let name = format!("XWLRVNC_FETCH_{which}_{}", self.fetch_seq);
         let property = self.intern(name.as_bytes());
+        // whatever a late answer to the fetch that last had this property left
+        // on it is not this owner's, and must not be read as its answer
+        self.properties
+            .lock()
+            .unwrap()
+            .remove(SELECTION_FETCH_WINDOW, property);
         crate::cliplog!("ConvertSelection {kind:?} to owner {owner:#x} time {time}");
-        self.selection.begin_fetch(Fetch {
+        let displaced = self.selection.begin_fetch(Fetch {
             kind,
             selection,
             property,
             owner,
             time,
+            since: Instant::now(),
         });
+        for stale in displaced {
+            crate::cliplog!(
+                "{:?} owner {:#x} never answered; giving up on it",
+                stale.kind,
+                stale.owner
+            );
+            self.fetched(stale, None);
+        }
         let request = xproto::SelectionRequestEvent {
             response_type: xproto::SELECTION_REQUEST_EVENT,
             sequence: self.seq,
@@ -1556,13 +1603,22 @@ impl Connection {
         if notify.requestor != SELECTION_FETCH_WINDOW {
             return;
         }
-        // matched by selection: PRIMARY and CLIPBOARD replies are both in
-        // flight, and answering the wrong one hands a selection the other's text
+        // matched by selection and property: PRIMARY and CLIPBOARD replies are
+        // both in flight, and so can two for one selection taken twice, and
+        // answering the wrong one hands a selection another's text
         let Some(fetch) = self.selection.take_fetch(notify.selection, notify.property) else {
             crate::cliplog!(
                 "SelectionNotify for selection {} answers no fetch",
                 notify.selection
             );
+            // a fetch given up on: what its owner stored is not wanted, and
+            // must not be there to be read as the next answer on that property
+            if self.is_fetch_property(notify.property) {
+                self.properties
+                    .lock()
+                    .unwrap()
+                    .remove(SELECTION_FETCH_WINDOW, notify.property);
+            }
             return;
         };
         let kind = fetch.kind;
@@ -1594,7 +1650,35 @@ impl Connection {
                 xproto::Property::DELETE,
             );
         } else {
+            // ICCCM: the owner may wait for the property to go before it takes
+            // the transfer to be done (Xt and GTK owners do, and hold the
+            // conversion open until their own timeout otherwise)
+            self.property_notify(
+                SELECTION_FETCH_WINDOW,
+                fetch.property,
+                xproto::Property::DELETE,
+            );
             self.fetched(fetch, Some(p.data));
+        }
+    }
+
+    /// Whether `atom` names a property of the fetch ring (on any connection:
+    /// atoms are global).
+    fn is_fetch_property(&self, atom: u32) -> bool {
+        self.atom_name(atom)
+            .is_some_and(|name| name.starts_with(b"XWLRVNC_FETCH_"))
+    }
+
+    /// Gives up on every fetch whose owner has run out of time to answer, as
+    /// though it had refused: see [`Selection::expired`].
+    fn sweep_fetches(&mut self) {
+        for fetch in self.selection.expired(Instant::now()) {
+            crate::cliplog!(
+                "{:?} owner {:#x} never answered; giving up on it",
+                fetch.kind,
+                fetch.owner
+            );
+            self.fetched(fetch, None);
         }
     }
 
@@ -2022,6 +2106,36 @@ pub fn read_request(r: &mut impl Read) -> io::Result<Option<RawRequest>> {
         remaining_length,
         body,
     }))
+}
+
+/// Waits until `stream` has something to read or `deadline` passes, saying
+/// which. A hangup or error counts as readable: the read that follows sees
+/// it. Unlike a read timeout on the socket, this consumes nothing, so a
+/// request that straddles the deadline is read whole afterwards.
+fn wait_readable(stream: &UnixStream, deadline: Instant) -> io::Result<bool> {
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        let timeout = i32::try_from(left.as_millis() + 1).unwrap_or(i32::MAX);
+        let mut pfd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd, for the count given
+        match unsafe { libc::poll(&mut pfd, 1, timeout) } {
+            0 => return Ok(false),
+            n if n > 0 => return Ok(true),
+            _ => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
 }
 
 /// Like `read_exact`, but distinguishes a clean EOF (no bytes read) from a
