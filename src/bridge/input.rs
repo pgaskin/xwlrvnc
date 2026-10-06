@@ -73,6 +73,10 @@ pub struct Input {
     /// first output is known, which falls back to a proportional mapping over
     /// the screen geometry.
     layout: Mutex<Option<Layout>>,
+    /// X keycodes we've sent a press for, as a bitset. XTest clients like
+    /// x11vnc forward autorepeated presses as-is, and xkb refcounts modifier
+    /// presses, so a repeated press of Shift would need two releases to clear.
+    pressed: Mutex<[u64; 4]>,
 }
 
 struct Backend {
@@ -91,6 +95,7 @@ impl Input {
             backend: OnceLock::new(),
             xkb: Mutex::new(None),
             layout: Mutex::new(None),
+            pressed: Mutex::new([0; 4]),
         }
     }
 
@@ -128,9 +133,31 @@ impl Input {
             .ok()
             .and_then(|ctx| Keymap::new_from_string(ctx, text, KeymapFormat::TextV1, 0).ok())
             .map(State::new);
-        if state.is_some() {
-            *self.xkb.lock().unwrap() = state;
+        let Some(mut state) = state else { return };
+        // replay held keys so a keymap change doesn't drop modifiers that are
+        // still down
+        let pressed = *self.pressed.lock().unwrap();
+        for kc in 0..=u8::MAX {
+            if pressed[(kc / 64) as usize] & (1 << (kc % 64)) != 0
+                && state.key_get_layout(u32::from(kc)).is_some()
+            {
+                state.update_key(u32::from(kc), KeyDirection::Down);
+            }
         }
+        *self.xkb.lock().unwrap() = Some(state);
+    }
+
+    /// Records a key press or release, returning false if it doesn't change
+    /// anything (a repeated press, or a release of a key that isn't down).
+    fn track_key(&self, x_keycode: u8, press: bool) -> bool {
+        let mut pressed = self.pressed.lock().unwrap();
+        let word = &mut pressed[(x_keycode / 64) as usize];
+        let bit = 1u64 << (x_keycode % 64);
+        if (*word & bit != 0) == press {
+            return false;
+        }
+        *word ^= bit;
+        true
     }
 
     /// Replays a key into the xkb state and forwards the resulting masks via
@@ -184,8 +211,8 @@ impl Input {
         let Some(b) = self.backend.get() else { return };
         match type_ {
             KEY_PRESS | KEY_RELEASE => {
-                if b.keymap_set.load(Ordering::Acquire) {
-                    let press = type_ == KEY_PRESS;
+                let press = type_ == KEY_PRESS;
+                if b.keymap_set.load(Ordering::Acquire) && self.track_key(detail, press) {
                     let evdev = u32::from(detail).wrapping_sub(8);
                     b.keyboard.key(self.time(), evdev, press as u32);
                     self.update_modifiers(b, detail, press);
