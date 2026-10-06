@@ -43,11 +43,23 @@ pub fn build(text: &str) -> Option<KeyTable> {
 
     let mut syms = Vec::with_capacity((MAX_KEYCODE - MIN_KEYCODE + 1) as usize * SYMS_PER as usize);
     for kc in MIN_KEYCODE..=MAX_KEYCODE {
-        for &m in &levels {
+        let mut key = [0u32; SYMS_PER as usize];
+        for (sym, &m) in key.iter_mut().zip(&levels) {
             state.update_mask(m, 0, 0, 0, 0, 0);
-            let sym = state.key_get_one_sym(u32::from(kc)).map_or(0, |s| s.raw());
-            syms.push(sym);
+            *sym = state.key_get_one_sym(u32::from(kc)).map_or(0, |s| s.raw());
         }
+        // Keys without a level3 symbol resolve to the same keysyms with Mod5
+        // set, so blank those out. Core clients treat the second pair as a
+        // separate group, and x11vnc's modtweak uses the last column a keysym
+        // appears in, so with duplicates it thinks shifted keysyms need
+        // Shift+AltGr and releases Shift around them.
+        if key[2] == key[0] {
+            key[2] = 0;
+        }
+        if key[3] == key[1] {
+            key[3] = 0;
+        }
+        syms.extend_from_slice(&key);
     }
     state.update_mask(0, 0, 0, 0, 0, 0);
 
